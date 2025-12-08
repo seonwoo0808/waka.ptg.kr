@@ -12,6 +12,7 @@ import (
 	"time"
 
 	"github.com/duke-git/lancet/v2/slice"
+	"github.com/duke-git/lancet/v2/strutil"
 
 	"log/slog"
 
@@ -35,12 +36,15 @@ const (
 	KeyLatestTotalUsers             = "latest_total_users"
 	KeyLastImport                   = "last_import"            // import attempt
 	KeyLastImportSuccess            = "last_successful_import" // last actual successful import
-	KeyFirstHeartbeat               = "first_heartbeat"
 	KeySubscriptionNotificationSent = "sub_reminder"
 	KeyNewsbox                      = "newsbox"
 	KeyInviteCode                   = "invite"
+	KeySharedData                   = "shared_data"
 
-	SessionKeyDefault = "default"
+	CookieKeySession               = "wakapi_session"
+	CookieKeyAuth                  = "wakapi_auth"
+	SessionValueOidcState          = "oidc_state"
+	SessionValueOidcIdTokenPayload = "oidc_id_token"
 
 	SimpleDateFormat     = "2006-01-02"
 	SimpleDateTimeFormat = "2006-01-02 15:04:05"
@@ -113,6 +117,7 @@ type appConfig struct {
 
 type securityConfig struct {
 	AllowSignup      bool `yaml:"allow_signup" default:"true" env:"WAKAPI_ALLOW_SIGNUP"`
+	OidcAllowSignup  bool `yaml:"oidc_allow_signup" default:"true" env:"WAKAPI_OIDC_ALLOW_SIGNUP"`
 	SignupCaptcha    bool `yaml:"signup_captcha" default:"false" env:"WAKAPI_SIGNUP_CAPTCHA"`
 	InviteCodes      bool `yaml:"invite_codes" default:"true" env:"WAKAPI_INVITE_CODES"`
 	ExposeMetrics    bool `yaml:"expose_metrics" default:"false" env:"WAKAPI_EXPOSE_METRICS"`
@@ -131,6 +136,7 @@ type securityConfig struct {
 	PasswordResetMaxRate         string                     `yaml:"password_reset_max_rate" default:"5/1h" env:"WAKAPI_PASSWORD_RESET_MAX_RATE"`
 	SecureCookie                 *securecookie.SecureCookie `yaml:"-"`
 	SessionKey                   []byte                     `yaml:"-"`
+	OidcProviders                []oidcProviderConfig       `yaml:"oidc"`
 	trustReverseProxyIpsParsed   []net.IPNet
 }
 
@@ -184,7 +190,7 @@ type sentryConfig struct {
 }
 
 type mailConfig struct {
-	Enabled            bool           `env:"WAKAPI_MAIL_ENABLED" default:"true"`
+	Enabled            bool           `env:"WAKAPI_MAIL_ENABLED" default:"false"`
 	Provider           string         `env:"WAKAPI_MAIL_PROVIDER" default:"smtp"`
 	Smtp               SMTPMailConfig `yaml:"smtp"`
 	Sender             string         `env:"WAKAPI_MAIL_SENDER" yaml:"sender"`
@@ -198,6 +204,15 @@ type SMTPMailConfig struct {
 	Password   string `env:"WAKAPI_MAIL_SMTP_PASS"`
 	TLS        bool   `env:"WAKAPI_MAIL_SMTP_TLS"`
 	SkipVerify bool   `env:"WAKAPI_MAIL_SMTP_SKIP_VERIFY"`
+}
+
+type oidcProviderConfig struct {
+	// for environment variables format, see renameEnvVars() down below
+	Name         string `yaml:"name"`
+	DisplayName  string `yaml:"display_name"` // optional
+	ClientID     string `yaml:"client_id"`
+	ClientSecret string `yaml:"client_secret"`
+	Endpoint     string `yaml:"endpoint"` // base url from which auto-discovery (.well-known/openid-configuration) can be found
 }
 
 type Config struct {
@@ -216,6 +231,32 @@ type Config struct {
 	Mail           mailConfig
 }
 
+func (c *oidcProviderConfig) String() string {
+	if c.DisplayName != "" {
+		return c.DisplayName
+	}
+	return strutil.Capitalize(c.Name)
+}
+
+func (c *oidcProviderConfig) Validate() error {
+	var namePattern = regexp.MustCompile("^[a-zA-Z0-9-]+$")
+	var endpointPattern = regexp.MustCompile("^https?://")
+
+	if !namePattern.MatchString(c.Name) {
+		return fmt.Errorf("invalid provider name '%s', must only contain alphanumeric characters or '-'", c.Name)
+	}
+	if c.ClientID == "" {
+		return fmt.Errorf("provider '%s' is missing client id", c.Name)
+	}
+	if c.ClientSecret == "" {
+		return fmt.Errorf("provider '%s' is missing client secret", c.Name)
+	}
+	if !endpointPattern.MatchString(c.Endpoint) {
+		return fmt.Errorf("provider '%s' is missing endpoint", c.Name)
+	}
+	return nil
+}
+
 func (c *Config) AppStartTimestamp() string {
 	return fmt.Sprintf("%d", appStartTime.Unix())
 }
@@ -229,6 +270,10 @@ func (c *Config) GetClearCookie(name string) *http.Cookie {
 }
 
 func (c *Config) createCookie(name, value, path string, maxAge int) *http.Cookie {
+	if path == "" {
+		path = "/"
+	}
+
 	return &http.Cookie{
 		Name:     name,
 		Value:    value,
@@ -401,6 +446,16 @@ func (c *securityConfig) GetPasswordResetMaxRate() (int, time.Duration) {
 	return c.parseRate(c.PasswordResetMaxRate)
 }
 
+func (c *securityConfig) GetOidcProvider(name string) (*OidcProvider, error) {
+	return GetOidcProvider(name)
+}
+
+func (c *securityConfig) ListOidcProviders() []string {
+	return slice.Map[oidcProviderConfig, string](c.OidcProviders, func(i int, provider oidcProviderConfig) string {
+		return provider.Name
+	})
+}
+
 func (c *securityConfig) parseRate(rate string) (int, time.Duration) {
 	pattern := regexp.MustCompile("(\\d+)/(\\d+)([smh])")
 	matches := pattern.FindStringSubmatch(rate)
@@ -501,8 +556,10 @@ func Get() *Config {
 }
 
 func Load(configFlag string, version string) *Config {
+	renameEnvVars()
+
 	config := &Config{}
-	if err := configor.New(&configor.Config{}).Load(config, configFlag); err != nil {
+	if err := configor.New(&configor.Config{ENVPrefix: "WAKAPI"}).Load(config, configFlag); err != nil {
 		Log().Fatal("failed to read config", err)
 	}
 
@@ -511,7 +568,7 @@ func Load(configFlag string, version string) *Config {
 	InitLogger(config.IsDev())
 
 	config.Version = strings.TrimSpace(version)
-	tagVersionMatch, _ := regexp.MatchString(`\d+\.\d+\.\d+`, version)
+	tagVersionMatch, _ := regexp.MatchString(`\d+\.\d+\.\d+`, config.Version)
 	if tagVersionMatch {
 		config.Version = "v" + config.Version
 	}
@@ -522,15 +579,22 @@ func Load(configFlag string, version string) *Config {
 	if config.Db.Type == "cockroach" {
 		slog.Warn("cockroach is not officially supported, it is strongly recommended to migrate to postgres instead")
 	}
+	if config.Db.IsMssql() {
+		slog.Error("mssql is not supported anymore, sorry")
+		os.Exit(1)
+	}
 
 	hashKey := securecookie.GenerateRandomKey(64)
 	blockKey := securecookie.GenerateRandomKey(32)
 	sessionKey := securecookie.GenerateRandomKey(32)
 
 	if IsDev(env) {
-		slog.Warn("using temporary keys to sign and encrypt cookies in dev mode, make sure to set env to production for real-world use")
+		slog.Warn("⚠️ using temporary keys to sign and encrypt cookies in dev mode, make sure to set env to production for real-world use")
 		hashKey, blockKey = getTemporarySecureKeys()
 		blockKey = hashKey
+	}
+	if config.Security.InsecureCookies {
+		slog.Warn("⚠️ it is strongly advised NOT to use insecure cookies, are you sure about this setting?")
 	}
 
 	config.Security.SecureCookie = securecookie.New(hashKey, blockKey)
@@ -577,6 +641,9 @@ func Load(configFlag string, version string) *Config {
 	if config.Mail.Provider != "" && utils.FindString(config.Mail.Provider, emailProviders, "") == "" {
 		Log().Fatal("unknown mail provider", "provider", config.Mail.Provider)
 	}
+	if config.Mail.Enabled && config.Mail.Sender == "" {
+		Log().Fatal("mail sender is required")
+	}
 	if _, err := time.ParseDuration(config.App.HeartbeatMaxAge); err != nil {
 		Log().Fatal("invalid duration set for heartbeat_max_age")
 	}
@@ -588,6 +655,11 @@ func Load(configFlag string, version string) *Config {
 	}
 	if d, err := time.Parse(config.App.DateTimeFormat, config.App.DateTimeFormat); err != nil || !d.Equal(time.Date(2006, time.January, 2, 15, 4, 0, 0, d.Location())) {
 		Log().Fatal("invalid datetime format", "format", config.App.DateTimeFormat)
+	}
+	for _, provider := range config.Security.OidcProviders {
+		if err := provider.Validate(); err != nil {
+			Log().Fatal("invalid oidc provider config", "provider", provider.Name, "error", err)
+		}
 	}
 
 	cronParser := cron.NewParser(cron.Second | cron.Minute | cron.Hour | cron.Dom | cron.Month | cron.Dow | cron.Descriptor)
@@ -621,6 +693,10 @@ func Load(configFlag string, version string) *Config {
 	}
 
 	Set(config)
+
+	// post config-load tasks
+	initOpenIDConnect(config)
+
 	return Get()
 }
 
@@ -639,4 +715,42 @@ func Empty() *Config {
 func BeginningOfWakatime() time.Time {
 	t, _ := time.Parse(SimpleDateFormat, heartbeatsMinDate)
 	return t
+}
+
+func initOpenIDConnect(config *Config) {
+	// openid connect
+	for _, c := range config.Security.OidcProviders {
+		RegisterOidcProvider(&c)
+		slog.Info("registered openid connect provider", "provider", c.Name)
+	}
+}
+
+func renameEnvVars() {
+	// Hacky way to get configor to read a slice of structs from environment variables using custom keys.
+	// Specifically, for the OpenID Connect providers config, configor would expect variables in this format:
+	// > WAKAPI_SECURITY_OIDCPROVIDERS_0_CLIENTID=<client id here>
+	// What we want instead (for consistency and beauty), rather is:
+	// > WAKAPI_OIDC_0_CLIENT_ID=<client id here>
+	// Since configor cannot parse slices with custom keys (see https://github.com/jinzhu/configor/issues/93)
+	// and neither allows to specify prefixes via tags (only the entire variable name as "env:"), we simply rename variables from the "Wakapi-style" format to what configor expects.
+	// In the long run, we might want to migrate to a different config parser (e.g. https://github.com/knadh/koanf), since configor seems to be dead.
+	// Also see https://github.com/muety/wakapi/issues/856.
+	var envOidcPrefix = regexp.MustCompile("WAKAPI_OIDC_PROVIDERS_(\\d+)_([A-Z_]+)")
+
+	for _, e := range os.Environ() {
+		parts := strings.Split(e, "=")
+		k, v := parts[0], parts[1]
+
+		// oidc providers config
+		if matches := envOidcPrefix.FindStringSubmatch(k); matches != nil {
+			index, _ := strconv.Atoi(matches[1]) // regex already made sure this is a proper integer
+			subkey := matches[2]
+
+			if err := os.Setenv(fmt.Sprintf("WAKAPI_SECURITY_OIDCPROVIDERS_%d_%s", index, strings.ReplaceAll(subkey, "_", "")), v); err != nil {
+				slog.Error("failed to rename env. variable", "key", k, "value", v, "error", err)
+				os.Exit(1)
+			}
+			os.Unsetenv(k)
+		}
+	}
 }

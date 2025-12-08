@@ -1,0 +1,33 @@
+meta {
+  name: Get heartbeats (readonly key)
+  type: http
+  seq: 16
+}
+
+get {
+  url: {{BASE_URL}}/api/compat/wakatime/v1/users/current/heartbeats?date={{yesterdayDate}}
+  body: none
+  auth: bearer
+}
+
+params:query {
+  date: {{yesterdayDate}}
+}
+
+auth:bearer {
+  token: {{ADDITIONAL_READ_ONLY_TOKEN}}
+}
+
+assert {
+  res.status: eq 200
+}
+
+tests {
+  test("Response body is correct", function () {
+      const date = new Date(bru.getVar('yesterdayDateIso'))
+      expect(res.body.timezone).to.eql(bru.getCollectionVar('TZ'));
+      expect(new Date(res.body.start)).to.eql(date);
+      expect(new Date(res.body.end)).to.eql(new Date(date.getTime() + 3600 * 1000 * 24 - 1000));
+      expect(res.body.data.length).to.eql(2);
+  });
+}

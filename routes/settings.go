@@ -3,6 +3,7 @@ package routes
 import (
 	"encoding/base64"
 	"fmt"
+	"log/slog"
 	"net/http"
 	"net/url"
 	"sort"
@@ -11,15 +12,13 @@ import (
 	"time"
 
 	"github.com/duke-git/lancet/v2/condition"
+	datastructure "github.com/duke-git/lancet/v2/datastructure/set"
 	"github.com/go-chi/chi/v5"
 	"github.com/gofrs/uuid/v5"
-	"github.com/muety/wakapi/helpers"
-
-	"log/slog"
-
-	datastructure "github.com/duke-git/lancet/v2/datastructure/set"
 	"github.com/gorilla/schema"
+
 	conf "github.com/muety/wakapi/config"
+	"github.com/muety/wakapi/helpers"
 	"github.com/muety/wakapi/middlewares"
 	"github.com/muety/wakapi/models"
 	"github.com/muety/wakapi/models/view"
@@ -43,6 +42,7 @@ type SettingsHandler struct {
 	projectLabelSrvc    services.IProjectLabelService
 	keyValueSrvc        services.IKeyValueService
 	mailSrvc            services.IMailService
+	apiKeySrvc          services.IApiKeyService
 	httpClient          *http.Client
 	aggregationLocks    map[string]bool
 }
@@ -71,6 +71,7 @@ func NewSettingsHandler(
 	projectLabelService services.IProjectLabelService,
 	keyValueService services.IKeyValueService,
 	mailService services.IMailService,
+	apiKeyService services.IApiKeyService,
 ) *SettingsHandler {
 	return &SettingsHandler{
 		config:              conf.Get(),
@@ -84,6 +85,7 @@ func NewSettingsHandler(
 		durationSrvc:        durationService,
 		keyValueSrvc:        keyValueService,
 		mailSrvc:            mailService,
+		apiKeySrvc:          apiKeyService,
 		httpClient:          &http.Client{Timeout: 10 * time.Second},
 		aggregationLocks:    make(map[string]bool),
 	}
@@ -106,7 +108,10 @@ func (h *SettingsHandler) GetIndex(w http.ResponseWriter, r *http.Request) {
 	if h.config.IsDev() {
 		loadTemplates()
 	}
-	templates[conf.SettingsTemplate].Execute(w, h.buildViewModel(r, w, nil))
+	err := templates[conf.SettingsTemplate].Execute(w, h.buildViewModel(r, w, nil))
+	if err != nil {
+		panic(err)
+	}
 }
 
 func (h *SettingsHandler) PostIndex(w http.ResponseWriter, r *http.Request) {
@@ -116,7 +121,10 @@ func (h *SettingsHandler) PostIndex(w http.ResponseWriter, r *http.Request) {
 
 	if err := r.ParseForm(); err != nil {
 		w.WriteHeader(http.StatusBadRequest)
-		templates[conf.SettingsTemplate].Execute(w, h.buildViewModel(r, w, nil).WithError("missing form values"))
+		err = templates[conf.SettingsTemplate].Execute(w, h.buildViewModel(r, w, nil).WithError("missing form values"))
+		if err != nil {
+			panic(err)
+		}
 		return
 	}
 
@@ -193,6 +201,10 @@ func (h *SettingsHandler) dispatchAction(action string) action {
 		return h.actionUpdateExcludeUnknownProjects
 	case "update_heartbeats_timeout":
 		return h.actionUpdateHeartbeatsTimeout
+	case "add_api_key":
+		return h.actionAddApiKey
+	case "delete_api_key":
+		return h.actionDeleteApiKey
 	}
 	return nil
 }
@@ -227,6 +239,9 @@ func (h *SettingsHandler) actionUpdateUser(w http.ResponseWriter, r *http.Reques
 	user.PublicLeaderboard = payload.PublicLeaderboard
 
 	if _, err := h.userSrvc.Update(user); err != nil {
+		if strings.Contains(err.Error(), "email address already in use") {
+			return actionResult{http.StatusBadRequest, "", "got invalid user data (email already taken?)", nil}
+		}
 		return actionResult{http.StatusInternalServerError, "", conf.ErrInternalServerError, nil}
 	}
 
@@ -239,6 +254,10 @@ func (h *SettingsHandler) actionChangePassword(w http.ResponseWriter, r *http.Re
 	}
 
 	user := middlewares.GetPrincipal(r)
+
+	if user.AuthType != "local" {
+		return actionResult{http.StatusBadRequest, "", "cannot reset password for non-local user", nil}
+	}
 
 	var credentials models.CredentialsReset
 	if err := r.ParseForm(); err != nil {
@@ -778,7 +797,7 @@ func (h *SettingsHandler) actionDeleteUser(w http.ResponseWriter, r *http.Reques
 	user := middlewares.GetPrincipal(r)
 	go func(user *models.User, r *http.Request) {
 		slog.Info("deleting user shortly", "userID", user.ID)
-		time.Sleep(5 * time.Minute)
+		//time.Sleep(5 * time.Minute)
 		if err := h.userSrvc.Delete(user); err != nil {
 			conf.Log().Request(r).Error("failed to delete user", "userID", user.ID, "error", err)
 		} else {
@@ -861,6 +880,54 @@ func (h *SettingsHandler) regenerateSummaries(user *models.User) error {
 	}
 
 	return nil
+}
+
+func (h *SettingsHandler) actionAddApiKey(w http.ResponseWriter, r *http.Request) actionResult {
+	if h.config.IsDev() {
+		loadTemplates()
+	}
+
+	apiKey := uuid.Must(uuid.NewV4()).String()
+
+	if _, err := h.apiKeySrvc.Create(&models.ApiKey{
+		User:     middlewares.GetPrincipal(r),
+		Label:    r.PostFormValue("api_name"),
+		ApiKey:   apiKey,
+		ReadOnly: r.PostFormValue("api_readonly") == "true",
+	}); err != nil {
+		return actionResult{http.StatusInternalServerError, "", conf.ErrInternalServerError, nil}
+	}
+
+	msg := fmt.Sprintf("you added new api key: %s", apiKey)
+	return actionResult{http.StatusOK, msg, "", nil}
+}
+
+func (h *SettingsHandler) actionDeleteApiKey(w http.ResponseWriter, r *http.Request) actionResult {
+	if h.config.IsDev() {
+		loadTemplates()
+	}
+
+	user := middlewares.GetPrincipal(r)
+	apiKeyValue := r.PostFormValue("api_key_value")
+
+	if apiKeyValue == user.ApiKey {
+		return actionResult{http.StatusBadRequest, "", "Main api key can only be regenerated, not deleted", nil}
+	}
+
+	apiKeys, err := h.apiKeySrvc.GetByUser(user.ID)
+	if err != nil {
+		return actionResult{http.StatusInternalServerError, "", "could not delete API key", nil}
+	}
+
+	for _, k := range apiKeys {
+		if k.ApiKey == apiKeyValue {
+			if err := h.apiKeySrvc.Delete(k); err != nil {
+				return actionResult{http.StatusInternalServerError, "", "could not delete API key", nil}
+			}
+			return actionResult{http.StatusOK, "API key deleted successfully", "", nil}
+		}
+	}
+	return actionResult{http.StatusNotFound, "", "API key not found", nil}
 }
 
 func (h *SettingsHandler) buildViewModel(r *http.Request, w http.ResponseWriter, args *map[string]interface{}) *view.SettingsViewModel {
@@ -949,15 +1016,47 @@ func (h *SettingsHandler) buildViewModel(r *http.Request, w http.ResponseWriter,
 	}
 
 	// user first data
-	var firstData time.Time
-	firstDataKv := h.keyValueSrvc.MustGetString(fmt.Sprintf("%s_%s", conf.KeyFirstHeartbeat, user.ID))
-	if firstDataKv.Value != "" {
-		firstData, _ = time.Parse(time.RFC822Z, firstDataKv.Value)
+	firstData, err := h.heartbeatSrvc.GetFirstByUser(user)
+	if err != nil {
+		conf.Log().Request(r).Error("error while user's heartbeats range", "user", user.ID, "error", err)
+		return &view.SettingsViewModel{
+			SharedLoggedInViewModel: view.SharedLoggedInViewModel{
+				SharedViewModel: view.NewSharedViewModel(h.config, &view.Messages{Error: criticalError}),
+				User:            user,
+			},
+		}
 	}
 
 	// invite link
 	inviteCode := getVal[string](args, valueInviteCode, "")
-	inviteLink := condition.TernaryOperator[bool, string](inviteCode == "", "", fmt.Sprintf("%s/signup?invite=%s", h.config.Server.GetPublicUrl(), inviteCode))
+	inviteLink := condition.Ternary[bool, string](inviteCode == "", "", fmt.Sprintf("%s/signup?invite=%s", h.config.Server.GetPublicUrl(), inviteCode))
+
+	// API keys
+	combinedApiKeys := []*view.SettingsApiKeys{
+		{
+			Name:     "Main API Key",
+			Value:    user.ApiKey,
+			ReadOnly: false,
+		},
+	}
+
+	apiKeys, err := h.apiKeySrvc.GetByUser(user.ID)
+	if err != nil {
+		conf.Log().Request(r).Error("error while fetching user's api keys", "user", user.ID, "error", err)
+		return &view.SettingsViewModel{
+			SharedLoggedInViewModel: view.SharedLoggedInViewModel{
+				SharedViewModel: view.NewSharedViewModel(h.config, &view.Messages{Error: criticalError}),
+				User:            user,
+			},
+		}
+	}
+	for _, apiKey := range apiKeys {
+		combinedApiKeys = append(combinedApiKeys, &view.SettingsApiKeys{
+			Name:     apiKey.Label,
+			Value:    apiKey.ApiKey,
+			ReadOnly: apiKey.ReadOnly,
+		})
+	}
 
 	vm := &view.SettingsViewModel{
 		SharedLoggedInViewModel: view.SharedLoggedInViewModel{
@@ -973,6 +1072,7 @@ func (h *SettingsHandler) buildViewModel(r *http.Request, w http.ResponseWriter,
 		SupportContact:      h.config.App.SupportContact,
 		DataRetentionMonths: h.config.App.DataRetentionMonths,
 		InviteLink:          inviteLink,
+		ApiKeys:             combinedApiKeys,
 	}
 
 	// readme card params

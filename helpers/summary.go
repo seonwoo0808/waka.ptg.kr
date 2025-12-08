@@ -5,6 +5,7 @@ import (
 	"net/http"
 	"time"
 
+	"github.com/muety/wakapi/config"
 	"github.com/muety/wakapi/models"
 )
 
@@ -77,11 +78,14 @@ func ParseSummaryFilters(r *http.Request) *models.Filters {
 }
 
 func extractUser(r *http.Request) *models.User {
-	type principalGetter interface {
-		GetPrincipal() *models.User
+	sharedData := r.Context().Value(config.KeySharedData)
+	if sharedData == nil {
+		config.Log().Error("request shared data not set while retrieving principal")
+		return nil
 	}
-	if p := r.Context().Value("principal"); p != nil {
-		return p.(principalGetter).GetPrincipal()
+	val := sharedData.(*config.SharedData).MustGet(config.MiddlewareKeyPrincipal)
+	if val == nil {
+		return nil
 	}
-	return nil
+	return val.(*models.User)
 }

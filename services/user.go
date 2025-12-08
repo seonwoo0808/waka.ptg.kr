@@ -10,13 +10,16 @@ import (
 
 	"github.com/duke-git/lancet/v2/convertor"
 	"github.com/duke-git/lancet/v2/datetime"
+	"github.com/duke-git/lancet/v2/validator"
 	"github.com/gofrs/uuid/v5"
 	"github.com/leandro-lugaresi/hub"
+	"github.com/patrickmn/go-cache"
+	"gorm.io/gorm"
+
 	"github.com/muety/wakapi/config"
 	"github.com/muety/wakapi/models"
 	"github.com/muety/wakapi/repositories"
 	"github.com/muety/wakapi/utils"
-	"github.com/patrickmn/go-cache"
 )
 
 type UserService struct {
@@ -25,17 +28,19 @@ type UserService struct {
 	eventBus            *hub.Hub
 	keyValueService     IKeyValueService
 	mailService         IMailService
+	apiKeyService       IApiKeyService
 	repository          repositories.IUserRepository
 	currentOnlineUsers  *cache.Cache
 	countersInitialized atomic.Bool
 }
 
-func NewUserService(keyValueService IKeyValueService, mailService IMailService, userRepo repositories.IUserRepository) *UserService {
+func NewUserService(keyValueService IKeyValueService, mailService IMailService, apiKeyService IApiKeyService, userRepo repositories.IUserRepository) *UserService {
 	srv := &UserService{
 		config:             config.Get(),
 		eventBus:           config.EventBus(),
 		cache:              cache.New(1*time.Hour, 2*time.Hour),
 		keyValueService:    keyValueService,
+		apiKeyService:      apiKeyService,
 		mailService:        mailService,
 		repository:         userRepo,
 		currentOnlineUsers: cache.New(models.DefaultHeartbeatsTimeout, 1*time.Minute),
@@ -95,7 +100,7 @@ func (srv *UserService) GetUserById(userId string) (*models.User, error) {
 	return u, nil
 }
 
-func (srv *UserService) GetUserByKey(key string) (*models.User, error) {
+func (srv *UserService) GetUserByKey(key string, requireFullAccessKey bool) (*models.User, error) {
 	if key == "" {
 		return nil, errors.New("key must not be empty")
 	}
@@ -105,17 +110,26 @@ func (srv *UserService) GetUserByKey(key string) (*models.User, error) {
 	}
 
 	u, err := srv.repository.FindOne(models.User{ApiKey: key})
-	if err != nil {
-		return nil, err
+	if err == nil {
+		srv.cache.SetDefault(u.ID, u)
+		return u, nil
 	}
 
-	srv.cache.SetDefault(u.ID, u)
-	return u, nil
+	apiKey, err := srv.apiKeyService.GetByApiKey(key, requireFullAccessKey)
+	if err == nil {
+		srv.cache.SetDefault(apiKey.User.ID, apiKey.User)
+		return apiKey.User, nil
+	}
+
+	return nil, err
 }
 
 func (srv *UserService) GetUserByEmail(email string) (*models.User, error) {
 	if email == "" {
 		return nil, errors.New("email must not be empty")
+	}
+	if !validator.IsEmail(email) {
+		return nil, errors.New("not a valid email")
 	}
 	return srv.repository.FindOne(models.User{Email: email})
 }
@@ -127,11 +141,28 @@ func (srv *UserService) GetUserByResetToken(resetToken string) (*models.User, er
 	return srv.repository.FindOne(models.User{ResetToken: resetToken})
 }
 
+func (srv *UserService) GetUserByUnsubscribeToken(unsubscribeToken string) (*models.User, error) {
+	if unsubscribeToken == "" {
+		return nil, errors.New("unsubscribe token must not be empty")
+	}
+	return srv.repository.FindOne(models.User{UnsubscribeToken: unsubscribeToken})
+}
+
 func (srv *UserService) GetUserByStripeCustomerId(customerId string) (*models.User, error) {
 	if customerId == "" {
 		return nil, errors.New("customer id must not be empty")
 	}
 	return srv.repository.FindOne(models.User{StripeCustomerId: customerId})
+}
+
+func (srv *UserService) GetUserByOidc(provider, sub string) (*models.User, error) {
+	if sub == "" || provider == "" {
+		return nil, errors.New("sub and provider must not be empty")
+	}
+	return srv.repository.FindOne(models.User{
+		Sub:      sub,
+		AuthType: provider,
+	})
 }
 
 func (srv *UserService) GetAll() ([]*models.User, error) {
@@ -215,6 +246,8 @@ func (srv *UserService) CreateOrGet(signup *models.Signup, isAdmin bool) (*model
 		Password:  signup.Password,
 		IsAdmin:   isAdmin,
 		InvitedBy: signup.InvitedBy,
+		AuthType:  signup.OidcProvider, // empty for local auth, will fallback to column default value
+		Sub:       signup.OidcSubject,
 	}
 
 	if hash, err := utils.HashPassword(u.Password, srv.config.Security.PasswordSalt); err != nil {
@@ -288,14 +321,27 @@ func (srv *UserService) GenerateResetToken(user *models.User) (*models.User, err
 	return srv.repository.UpdateField(user, "reset_token", uuid.Must(uuid.NewV4()))
 }
 
+func (srv *UserService) GenerateUnsubscribeToken(user *models.User) (*models.User, error) {
+	return srv.repository.UpdateField(user, "unsubscribe_token", uuid.Must(uuid.NewV4()))
+}
+
 func (srv *UserService) Delete(user *models.User) error {
 	srv.FlushUserCache(user.ID)
 
 	user.ReportsWeekly = false
 	srv.notifyUpdate(user)
-	srv.notifyDelete(user)
 
-	return srv.repository.Delete(user)
+	return srv.repository.RunInTx(func(tx *gorm.DB) error {
+		if err := srv.repository.DeleteTx(user, tx); err != nil {
+			return err
+		}
+		if err := srv.keyValueService.DeleteWildcardTx(fmt.Sprintf("*_%s", user.ID), tx); err != nil {
+			return err
+		}
+
+		srv.notifyDelete(user)
+		return nil
+	})
 }
 
 func (srv *UserService) MapUsersById(users []*models.User) map[string]*models.User {

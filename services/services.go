@@ -4,6 +4,8 @@ import (
 	"time"
 
 	datastructure "github.com/duke-git/lancet/v2/datastructure/set"
+	"gorm.io/gorm"
+
 	"github.com/muety/wakapi/models"
 	"github.com/muety/wakapi/models/types"
 	"github.com/muety/wakapi/utils"
@@ -40,7 +42,11 @@ type IHeartbeatService interface {
 	CountByUsers([]*models.User) ([]*models.CountByUser, error)
 	GetAllWithin(time.Time, time.Time, *models.User) ([]*models.Heartbeat, error)
 	GetAllWithinByFilters(time.Time, time.Time, *models.User, *models.Filters) ([]*models.Heartbeat, error)
-	GetFirstByUsers() ([]*models.TimeByUser, error)
+	GetFirstAll() ([]*models.TimeByUser, error)
+	GetLastAll() ([]*models.TimeByUser, error)
+	GetRangeByUser(*models.User) (*models.RangeByUser, error)
+	GetFirstByUser(*models.User) (time.Time, error)
+	GetLastByUser(*models.User) (time.Time, error)
 	GetLatestByUser(*models.User) (*models.Heartbeat, error)
 	GetLatestByOriginAndUser(string, *models.User) (*models.Heartbeat, error)
 	GetLatestByFilters(*models.User, *models.Filters) (*models.Heartbeat, error)
@@ -51,6 +57,7 @@ type IHeartbeatService interface {
 	DeleteByUser(*models.User) error
 	DeleteByUserBefore(*models.User, time.Time) error
 	GetUserProjectStats(*models.User, time.Time, time.Time, *utils.PageParams, bool) ([]*models.ProjectStats, error)
+	GetUserAgentsByUser(*models.User) ([]*models.UserAgent, error)
 }
 
 type IDiagnosticsService interface {
@@ -63,6 +70,9 @@ type IKeyValueService interface {
 	GetByPrefix(string) ([]*models.KeyStringValue, error)
 	PutString(*models.KeyStringValue) error
 	DeleteString(string) error
+	DeleteStringTx(string, *gorm.DB) error
+	DeleteWildcard(string) error
+	DeleteWildcardTx(string, *gorm.DB) error
 	ReplaceKeySuffix(string, string) error
 }
 
@@ -138,10 +148,12 @@ type ILeaderboardService interface {
 
 type IUserService interface {
 	GetUserById(string) (*models.User, error)
-	GetUserByKey(string) (*models.User, error)
+	GetUserByKey(string, bool) (*models.User, error)
 	GetUserByEmail(string) (*models.User, error)
 	GetUserByResetToken(string) (*models.User, error)
+	GetUserByUnsubscribeToken(string) (*models.User, error)
 	GetUserByStripeCustomerId(string) (*models.User, error)
+	GetUserByOidc(string, string) (*models.User, error)
 	GetAll() ([]*models.User, error)
 	GetAllMapped() (map[string]*models.User, error)
 	GetMany([]string) ([]*models.User, error)
@@ -158,6 +170,14 @@ type IUserService interface {
 	ResetApiKey(*models.User) (*models.User, error)
 	SetWakatimeApiCredentials(*models.User, string, string) (*models.User, error)
 	GenerateResetToken(*models.User) (*models.User, error)
+	GenerateUnsubscribeToken(*models.User) (*models.User, error)
 	FlushCache()
 	FlushUserCache(string)
+}
+
+type IApiKeyService interface {
+	GetByApiKey(string, bool) (*models.ApiKey, error)
+	GetByUser(string) ([]*models.ApiKey, error)
+	Create(*models.ApiKey) (*models.ApiKey, error)
+	Delete(*models.ApiKey) error
 }

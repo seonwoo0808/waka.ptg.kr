@@ -1,10 +1,11 @@
 package mocks
 
 import (
+	"time"
+
 	"github.com/muety/wakapi/models"
 	"github.com/muety/wakapi/utils"
 	"github.com/stretchr/testify/mock"
-	"time"
 )
 
 type HeartbeatServiceMock struct {
@@ -56,9 +57,29 @@ func (m *HeartbeatServiceMock) StreamAllWithinByFilters(t time.Time, t2 time.Tim
 	return args.Get(0).(chan *models.Heartbeat), args.Error(1)
 }
 
-func (m *HeartbeatServiceMock) GetFirstByUsers() ([]*models.TimeByUser, error) {
+func (m *HeartbeatServiceMock) GetFirstAll() ([]*models.TimeByUser, error) {
 	args := m.Called()
 	return args.Get(0).([]*models.TimeByUser), args.Error(1)
+}
+
+func (m *HeartbeatServiceMock) GetLastAll() ([]*models.TimeByUser, error) {
+	args := m.Called()
+	return args.Get(0).([]*models.TimeByUser), args.Error(1)
+}
+
+func (m *HeartbeatServiceMock) GetFirstByUser(u *models.User) (time.Time, error) {
+	args := m.Called(u)
+	return args.Get(0).(time.Time), args.Error(1)
+}
+
+func (m *HeartbeatServiceMock) GetLastByUser(u *models.User) (time.Time, error) {
+	args := m.Called(u)
+	return args.Get(0).(time.Time), args.Error(1)
+}
+
+func (m *HeartbeatServiceMock) GetRangeByUser(u *models.User) (*models.RangeByUser, error) {
+	args := m.Called(u)
+	return args.Get(0).(*models.RangeByUser), args.Error(1)
 }
 
 func (m *HeartbeatServiceMock) GetLatestByUser(user *models.User) (*models.Heartbeat, error) {
@@ -99,4 +120,9 @@ func (m *HeartbeatServiceMock) DeleteByUserBefore(u *models.User, t time.Time) e
 func (m *HeartbeatServiceMock) GetUserProjectStats(u *models.User, t, t2 time.Time, p *utils.PageParams, b bool) ([]*models.ProjectStats, error) {
 	args := m.Called(u, t, t2, p, b)
 	return args.Get(0).([]*models.ProjectStats), args.Error(1)
+}
+
+func (m *HeartbeatServiceMock) GetUserAgentsByUser(u *models.User) ([]*models.UserAgent, error) {
+	args := m.Called(u)
+	return args.Get(0).([]*models.UserAgent), args.Error(0)
 }

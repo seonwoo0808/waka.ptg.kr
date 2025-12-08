@@ -4,21 +4,29 @@ import (
 	"encoding/base64"
 	"errors"
 	"fmt"
-	"github.com/muety/wakapi/config"
-	"github.com/stretchr/testify/mock"
 	"net/http"
+	"net/http/httptest"
 	"net/url"
+	"strings"
 	"testing"
+	"time"
 
+	"github.com/oauth2-proxy/mockoidc"
+	"github.com/stretchr/testify/assert"
+	"github.com/stretchr/testify/mock"
+
+	"github.com/muety/wakapi/config"
 	"github.com/muety/wakapi/mocks"
 	"github.com/muety/wakapi/models"
-	"github.com/stretchr/testify/assert"
+	routeutils "github.com/muety/wakapi/routes/utils"
 )
 
 func TestAuthenticateMiddleware_tryGetUserByApiKeyHeader_Success(t *testing.T) {
 	testApiKey := "z5uig69cn9ut93n"
 	testToken := base64.StdEncoding.EncodeToString([]byte(testApiKey))
 	testUser := &models.User{ApiKey: testApiKey}
+	// In the case of the API Key from User Model - it's always full access
+	testApiKeyRequireFullAccess := false
 
 	mockRequest := &http.Request{
 		Header: http.Header{
@@ -27,7 +35,7 @@ func TestAuthenticateMiddleware_tryGetUserByApiKeyHeader_Success(t *testing.T) {
 	}
 
 	userServiceMock := new(mocks.UserServiceMock)
-	userServiceMock.On("GetUserByKey", testApiKey).Return(testUser, nil)
+	userServiceMock.On("GetUserByKey", testApiKey, testApiKeyRequireFullAccess).Return(testUser, nil)
 
 	sut := NewAuthenticateMiddleware(userServiceMock)
 
@@ -51,6 +59,29 @@ func TestAuthenticateMiddleware_tryGetUserByApiKeyHeader_Invalid(t *testing.T) {
 	userServiceMock := new(mocks.UserServiceMock)
 
 	sut := NewAuthenticateMiddleware(userServiceMock)
+	sut.WithFullAccessOnly(false)
+
+	result, err := sut.tryGetUserByApiKeyHeader(mockRequest)
+
+	assert.Error(t, err)
+	assert.Nil(t, result)
+}
+
+func TestAuthenticateMiddleware_tryGetUserByApiKeyHeaderWithReadOnlyKey_Invalid(t *testing.T) {
+	testApiKey := "read-only-additional-key"
+	testToken := base64.StdEncoding.EncodeToString([]byte(testApiKey))
+
+	mockRequest := &http.Request{
+		Header: http.Header{
+			"Authorization": []string{fmt.Sprintf("Basic %s", testToken)},
+		},
+	}
+
+	userServiceMock := new(mocks.UserServiceMock)
+	userServiceMock.On("GetUserByKey", testApiKey, true).Return(nil, errors.New("forbidden: requires full access"))
+
+	sut := NewAuthenticateMiddleware(userServiceMock)
+	sut.WithFullAccessOnly(true)
 
 	result, err := sut.tryGetUserByApiKeyHeader(mockRequest)
 
@@ -61,6 +92,8 @@ func TestAuthenticateMiddleware_tryGetUserByApiKeyHeader_Invalid(t *testing.T) {
 func TestAuthenticateMiddleware_tryGetUserByApiKeyQuery_Success(t *testing.T) {
 	testApiKey := "z5uig69cn9ut93n"
 	testUser := &models.User{ApiKey: testApiKey}
+	// In the case of the API Key from User Model - it's always full access
+	testApiKeyRequireFullAccess := true
 
 	params := url.Values{}
 	params.Add("api_key", testApiKey)
@@ -71,9 +104,10 @@ func TestAuthenticateMiddleware_tryGetUserByApiKeyQuery_Success(t *testing.T) {
 	}
 
 	userServiceMock := new(mocks.UserServiceMock)
-	userServiceMock.On("GetUserByKey", testApiKey).Return(testUser, nil)
+	userServiceMock.On("GetUserByKey", testApiKey, testApiKeyRequireFullAccess).Return(testUser, nil)
 
 	sut := NewAuthenticateMiddleware(userServiceMock)
+	sut.WithFullAccessOnly(true)
 
 	result, err := sut.tryGetUserByApiKeyQuery(mockRequest)
 
@@ -247,6 +281,109 @@ func TestAuthenticateMiddleware_tryGetUserByTrustedHeader_Signup(t *testing.T) {
 		assert.Nil(t, result)
 		userServiceMock.AssertNumberOfCalls(t, "GetUserById", 2)
 	}
+}
+
+func TestAuthenticateMiddleware_tryHandleOidc_NoToken(t *testing.T) {
+	config.Set(config.Empty())
+
+	userServiceMock := new(mocks.UserServiceMock)
+
+	r := httptest.NewRequest(http.MethodGet, "/summary", nil)
+	w := httptest.NewRecorder()
+
+	sut := NewAuthenticateMiddleware(userServiceMock)
+
+	assert.False(t, sut.tryHandleOidc(w, r))
+	assert.NotEqual(t, w.Code, http.StatusTemporaryRedirect)
+	assert.NotEqual(t, w.Code, http.StatusFound)
+}
+
+func TestAuthenticateMiddleware_tryHandleOidc_InvalidToken_ExistingUser(t *testing.T) {
+	const (
+		testProvider = "mock"
+		testSub      = "testsub"
+	)
+	var testUser = &models.User{ID: "testuser"}
+
+	oidcMock, _ := mockoidc.Run()
+	defer oidcMock.Shutdown()
+
+	cfg := config.Empty()
+	config.Set(cfg)
+	config.WithOidcProvider(cfg, testProvider, oidcMock.ClientID, oidcMock.ClientSecret, oidcMock.Addr()+"/oidc")
+
+	r := httptest.NewRequest(http.MethodGet, "/summary", nil)
+	w := httptest.NewRecorder()
+
+	testIdToken := &config.IdTokenPayload{
+		Subject:      testSub,
+		Expiry:       time.Now().Add(-time.Minute).Unix(),
+		ProviderName: testProvider,
+	}
+	routeutils.SetOidcIdTokenPayload(testIdToken, r, w)
+
+	userServiceMock := new(mocks.UserServiceMock)
+	userServiceMock.On("GetUserByOidc", testProvider, testSub).Return(testUser, nil)
+
+	sut := NewAuthenticateMiddleware(userServiceMock)
+
+	assert.True(t, sut.tryHandleOidc(w, r))
+	assert.Equal(t, w.Code, http.StatusFound)
+	assert.True(t, strings.HasPrefix(w.Header().Get("Location"), oidcMock.AuthorizationEndpoint()))
+	assert.NotEmpty(t, routeutils.GetOidcState(r))
+	assert.Contains(t, w.Header().Get("Location"), fmt.Sprintf("state=%s", routeutils.GetOidcState(r)))
+}
+
+func TestAuthenticateMiddleware_tryHandleOidc_InvalidToken_NonExistingUser(t *testing.T) {
+	const (
+		testProvider = "mock"
+		testSub      = "testsub"
+	)
+
+	oidcMock, _ := mockoidc.Run()
+	defer oidcMock.Shutdown()
+
+	cfg := config.Empty()
+	config.Set(cfg)
+	config.WithOidcProvider(cfg, testProvider, oidcMock.ClientID, oidcMock.ClientSecret, oidcMock.Addr()+"/oidc")
+
+	r := httptest.NewRequest(http.MethodGet, "/summary", nil)
+	w := httptest.NewRecorder()
+
+	testIdToken := &config.IdTokenPayload{
+		Subject:      testSub,
+		Expiry:       time.Now().Add(-time.Minute).Unix(),
+		ProviderName: testProvider,
+	}
+	routeutils.SetOidcIdTokenPayload(testIdToken, r, w)
+
+	userServiceMock := new(mocks.UserServiceMock)
+	userServiceMock.On("GetUserByOidc", testProvider, testSub).Return(nil, errors.New(""))
+
+	sut := NewAuthenticateMiddleware(userServiceMock)
+
+	assert.False(t, sut.tryHandleOidc(w, r))
+	assert.NotEqual(t, w.Code, http.StatusTemporaryRedirect)
+	assert.NotEqual(t, w.Code, http.StatusFound)
+}
+
+func TestAuthenticateMiddleware_tryHandleOidc_ValidToken(t *testing.T) {
+	config.Set(config.Empty())
+
+	userServiceMock := new(mocks.UserServiceMock)
+
+	r := httptest.NewRequest(http.MethodGet, "/summary", nil)
+	w := httptest.NewRecorder()
+
+	routeutils.SetOidcIdTokenPayload(&config.IdTokenPayload{
+		Expiry: time.Now().Add(1 * time.Minute).Unix(),
+	}, r, w)
+
+	sut := NewAuthenticateMiddleware(userServiceMock)
+
+	assert.False(t, sut.tryHandleOidc(w, r))
+	assert.NotEqual(t, w.Code, http.StatusTemporaryRedirect)
+	assert.NotEqual(t, w.Code, http.StatusFound)
 }
 
 // TODO: somehow test cookie auth function

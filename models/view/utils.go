@@ -28,9 +28,24 @@ func GetLanguageIcon(language string) string {
 		"react":      "react",
 		"bash":       "bash",
 		"json":       "code-json",
+		"nix":        "nix",
 	}
 	if match, ok := langs[strings.ToLower(language)]; ok {
 		return "mdi:" + match
 	}
 	return ""
+}
+
+func GetOidcProviderIcon(provider string) string {
+	providers := map[string]string{
+		"github":    "codicon:github-inverted",
+		"gitlab":    "devicon-plain:gitlab",
+		"codeberg":  "devicon-plain:codeberg",
+		"google":    "devicon-plain:google",
+		"microsoft": "mdi:microsoft",
+		"facebook":  "devicon-plain:facebook",
+		"okta":      "devicon-plain:okta",
+	}
+	match, _ := providers[strings.ToLower(provider)]
+	return match
 }

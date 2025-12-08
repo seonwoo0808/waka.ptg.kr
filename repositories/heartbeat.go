@@ -168,26 +168,22 @@ func (r *HeartbeatRepository) GetLatestByFilters(user *models.User, filterMap ma
 	return heartbeat, nil
 }
 
-func (r *HeartbeatRepository) GetFirstByUsers() ([]*models.TimeByUser, error) {
+func (r *HeartbeatRepository) GetFirstAll() ([]*models.TimeByUser, error) {
 	var result []*models.TimeByUser
-	r.db.Raw("with agg as (select " + utils.QuoteSql(r.db, "user_id, min(time) as %s", "time") + " from heartbeats group by user_id) " +
-		"select " + utils.QuoteSql(r.db, "id as %s, time ", "user") +
-		"from users " +
-		"left join agg on agg.user_id = id " +
-		"order by users.id").
-		Scan(&result)
-	return result, nil
+	err := r.db.Raw("select user_id as user, first as time from user_heartbeats_range").Scan(&result).Error
+	return result, err
 }
 
-func (r *HeartbeatRepository) GetLastByUsers() ([]*models.TimeByUser, error) {
+func (r *HeartbeatRepository) GetLastAll() ([]*models.TimeByUser, error) {
 	var result []*models.TimeByUser
-	r.db.Raw("with agg as (select " + utils.QuoteSql(r.db, "user_id, max(time) as %s", "time") + " from heartbeats group by user_id) " +
-		"select " + utils.QuoteSql(r.db, "id as %s, time ", "user") +
-		"from users " +
-		"left join agg on agg.user_id = id " +
-		"order by users.id").
-		Scan(&result)
-	return result, nil
+	err := r.db.Raw("select user_id as user, last as time from user_heartbeats_range").Scan(&result).Error
+	return result, err
+}
+
+func (r *HeartbeatRepository) GetRangeByUser(user *models.User) (*models.RangeByUser, error) {
+	var result *models.RangeByUser
+	err := r.db.Raw("select user_id as user, first, last from user_heartbeats_range where user_id = ?", user.ID).Scan(&result).Error
+	return result, err
 }
 
 func (r *HeartbeatRepository) Count(approximate bool) (count int64, err error) {
@@ -300,11 +296,6 @@ func (r *HeartbeatRepository) GetUserProjectStats(user *models.User, from, to ti
 		sql.Named("offset", offset),
 	}
 
-	limitOffsetClause := "limit @limit offset @offset"
-	if r.config.Db.IsMssql() {
-		limitOffsetClause = "offset @offset ROWS fetch next @limit rows only"
-	}
-
 	query := `
 			with project_stats as (
 				select
@@ -344,7 +335,7 @@ func (r *HeartbeatRepository) GetUserProjectStats(user *models.User, from, to ti
 			order by ps.last desc
 	`
 
-	query += limitOffsetClause
+	query += "limit @limit offset @offset"
 
 	if err := r.db.
 		Raw(query, args...).
@@ -353,4 +344,18 @@ func (r *HeartbeatRepository) GetUserProjectStats(user *models.User, from, to ti
 	}
 
 	return projectStats, nil
+}
+
+func (r *HeartbeatRepository) GetUserAgentsByUser(user *models.User) ([]*models.UserAgent, error) {
+	var results []*models.UserAgent
+	if err := r.db.
+		Model(&models.Heartbeat{}).
+		Select("user_agent as value, operating_system as os, editor, min(time) as first_seen, max(time) as last_seen").
+		Where(&models.Heartbeat{UserID: user.ID}).
+		Not("user_agent = ''").
+		Group("user_agent, operating_system, editor").
+		Find(&results).Error; err != nil {
+		return nil, err
+	}
+	return results, nil
 }

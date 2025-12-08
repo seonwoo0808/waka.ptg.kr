@@ -8,6 +8,7 @@ import (
 	"time"
 
 	"github.com/dchest/captcha"
+	"github.com/duke-git/lancet/v2/random"
 	conf "github.com/muety/wakapi/config"
 	"github.com/muety/wakapi/utils"
 )
@@ -45,6 +46,7 @@ type User struct {
 	WakatimeApiKey         string      `json:"-"` // for relay middleware and imports
 	WakatimeApiUrl         string      `json:"-"` // for relay middleware and imports
 	ResetToken             string      `json:"-"`
+	UnsubscribeToken       string      `json:"-"`
 	ReportsWeekly          bool        `json:"-" gorm:"default:false; type:bool"`
 	PublicLeaderboard      bool        `json:"-" gorm:"default:false; type:bool"`
 	SubscribedUntil        *CustomTime `json:"-" swaggertype:"string" format:"date" example:"2006-01-02 15:04:05.000"`
@@ -53,6 +55,8 @@ type User struct {
 	InvitedBy              string      `json:"-"`
 	ExcludeUnknownProjects bool        `json:"-"`
 	HeartbeatsTimeoutSec   int         `json:"-" gorm:"default:600"` // https://github.com/muety/wakapi/issues/156
+	AuthType               string      `json:"auth_type" gorm:"default:local; size:255"`
+	Sub                    string      `json:"sub" gorm:"size:255"` // openid connect subject
 }
 
 type Login struct {
@@ -70,6 +74,8 @@ type Signup struct {
 	Captcha        string `schema:"captcha"`
 	InviteCode     string `schema:"invite_code"`
 	InvitedBy      string `schema:"-"`
+	OidcProvider   string `schema:"-"`
+	OidcSubject    string `schema:"-"`
 }
 
 type SetPasswordRequest struct {
@@ -96,6 +102,12 @@ type UserDataUpdate struct {
 	PublicLeaderboard bool   `schema:"public_leaderboard"`
 }
 
+type RangeByUser struct {
+	User  string
+	First CustomTime
+	Last  CustomTime
+}
+
 type TimeByUser struct {
 	User string
 	Time CustomTime
@@ -104,6 +116,19 @@ type TimeByUser struct {
 type CountByUser struct {
 	User  string
 	Count int64
+}
+
+func SignupFromOidcIdToken(idToken *conf.IdTokenPayload) *Signup {
+	tempPassword := random.RandString(32) // users must not be able to log in with password, so we simply set it to a random string that we forget afterwards
+
+	return &Signup{
+		Username:       idToken.Username(),
+		Email:          idToken.Email,
+		Password:       tempPassword,
+		PasswordRepeat: tempPassword,
+		OidcProvider:   idToken.ProviderName,
+		OidcSubject:    idToken.Subject,
+	}
 }
 
 func (u *User) Identity() string {
@@ -205,6 +230,10 @@ func (u *User) AnyDataShared() bool {
 	return u.ShareDataMaxDays != 0 && (u.ShareEditors || u.ShareLanguages || u.ShareProjects || u.ShareOSs || u.ShareMachines || u.ShareLabels)
 }
 
+func (u *User) UnsubscribeLink() string {
+	return fmt.Sprintf("%s/unsubscribe?token=%s", conf.Get().Server.GetPublicUrl(), u.UnsubscribeToken)
+}
+
 func (c *CredentialsReset) IsValid() bool {
 	return ValidatePassword(c.PasswordNew) &&
 		c.PasswordNew == c.PasswordRepeat
@@ -217,11 +246,17 @@ func (c *SetPasswordRequest) IsValid() bool {
 
 func (s *Signup) IsValid() bool {
 	config := conf.Get()
+
+	captchaValid := s.OidcProvider != "" || !config.Security.SignupCaptcha
+	if !captchaValid && config.Security.SignupCaptcha {
+		captchaValid = ValidateCaptcha(s.CaptchaId, s.Captcha)
+	}
+
 	return ValidateUsername(s.Username) &&
 		ValidateEmail(s.Email) &&
 		ValidatePassword(s.Password) &&
-		(!config.Security.SignupCaptcha || ValidateCaptcha(s.CaptchaId, s.Captcha)) &&
-		s.Password == s.PasswordRepeat
+		s.Password == s.PasswordRepeat &&
+		captchaValid
 }
 
 func (r *UserDataUpdate) IsValid() bool {

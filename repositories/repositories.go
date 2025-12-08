@@ -3,6 +3,8 @@ package repositories
 import (
 	"time"
 
+	"gorm.io/gorm"
+
 	"github.com/muety/wakapi/models"
 )
 
@@ -10,6 +12,7 @@ type IBaseRepository interface {
 	GetDialector() string
 	GetTableDDLMysql(string) (string, error)
 	GetTableDDLSqlite(string) (string, error)
+	RunInTx(func(*gorm.DB) error) error
 	VacuumOrOptimize()
 }
 
@@ -32,8 +35,9 @@ type IHeartbeatRepository interface {
 	GetWithin(time.Time, time.Time, *models.User) ([]*models.Heartbeat, error)
 	GetAllWithinByFilters(time.Time, time.Time, *models.User, map[string][]string) ([]*models.Heartbeat, error)
 	GetLatestByFilters(*models.User, map[string][]string) (*models.Heartbeat, error)
-	GetFirstByUsers() ([]*models.TimeByUser, error)
-	GetLastByUsers() ([]*models.TimeByUser, error)
+	GetFirstAll() ([]*models.TimeByUser, error)
+	GetLastAll() ([]*models.TimeByUser, error)
+	GetRangeByUser(*models.User) (*models.RangeByUser, error)
 	GetLatestByUser(*models.User) (*models.Heartbeat, error)
 	GetLatestByOriginAndUser(string, *models.User) (*models.Heartbeat, error)
 	StreamWithin(time.Time, time.Time, *models.User) (chan *models.Heartbeat, error)
@@ -47,6 +51,7 @@ type IHeartbeatRepository interface {
 	DeleteByUser(*models.User) error
 	DeleteByUserBefore(*models.User, time.Time) error
 	GetUserProjectStats(*models.User, time.Time, time.Time, int, int) ([]*models.ProjectStats, error)
+	GetUserAgentsByUser(user *models.User) ([]*models.UserAgent, error)
 }
 
 type IDurationRepository interface {
@@ -73,6 +78,9 @@ type IKeyValueRepository interface {
 	GetString(string) (*models.KeyStringValue, error)
 	PutString(*models.KeyStringValue) error
 	DeleteString(string) error
+	DeleteStringTx(string, *gorm.DB) error
+	DeleteWildcard(string) error
+	DeleteWildcardTx(string, *gorm.DB) error
 	Search(string) ([]*models.KeyStringValue, error)
 	ReplaceKeySuffix(string, string) error
 }
@@ -121,6 +129,7 @@ type IUserRepository interface {
 	Update(*models.User) (*models.User, error)
 	UpdateField(*models.User, string, interface{}) (*models.User, error)
 	Delete(*models.User) error
+	DeleteTx(*models.User, *gorm.DB) error
 }
 
 type ILeaderboardRepository interface {
@@ -133,4 +142,13 @@ type ILeaderboardRepository interface {
 	GetAll() ([]*models.LeaderboardItem, error)
 	GetAllAggregatedByInterval(*models.IntervalKey, *uint8, int, int) ([]*models.LeaderboardItemRanked, error)
 	GetAggregatedByUserAndInterval(string, *models.IntervalKey, *uint8, int, int) ([]*models.LeaderboardItemRanked, error)
+}
+
+type IApiKeyRepository interface {
+	IBaseRepository
+	GetAll() ([]*models.ApiKey, error)
+	GetByUser(string) ([]*models.ApiKey, error)
+	GetByApiKey(string, bool) (*models.ApiKey, error)
+	Insert(*models.ApiKey) (*models.ApiKey, error)
+	Delete(string) error
 }

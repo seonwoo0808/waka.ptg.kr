@@ -1,6 +1,8 @@
 package utils
 
-import "strings"
+import (
+	"strings"
+)
 
 func SubSlice[T any](slice []T, from, to uint) []T {
 	if int(from) > len(slice) {

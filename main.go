@@ -8,16 +8,17 @@ import (
 	"log/slog"
 	"net"
 	"net/http"
+	_ "net/http/pprof"
 	"os"
 	"strconv"
 	"time"
 
 	"github.com/duke-git/lancet/v2/condition"
-
 	_ "github.com/glebarez/sqlite"
 	"github.com/go-chi/chi/v5"
 	"github.com/go-chi/chi/v5/middleware"
 	"github.com/lpar/gzipped/v2"
+	"github.com/muety/wakapi/utils"
 	httpSwagger "github.com/swaggo/http-swagger"
 	_ "gorm.io/driver/mysql"
 	_ "gorm.io/driver/postgres"
@@ -38,8 +39,6 @@ import (
 	"github.com/muety/wakapi/services/mail"
 	"github.com/muety/wakapi/static/docs"
 	fsutils "github.com/muety/wakapi/utils/fs"
-
-	_ "net/http/pprof"
 )
 
 // Embed version.txt
@@ -69,6 +68,7 @@ var (
 	diagnosticsRepository     repositories.IDiagnosticsRepository
 	metricsRepository         *repositories.MetricsRepository
 	durationRepository        *repositories.DurationRepository
+	apiKeyRepository          repositories.IApiKeyRepository
 )
 
 var (
@@ -88,6 +88,7 @@ var (
 	diagnosticsService     services.IDiagnosticsService
 	housekeepingService    services.IHousekeepingService
 	miscService            services.IMiscService
+	apiKeyService          services.IApiKeyService
 )
 
 // TODO: Refactor entire project to be structured after business domains
@@ -125,7 +126,7 @@ func main() {
 	// Configure Swagger docs
 	docs.SwaggerInfo.BasePath = config.Server.BasePath + "/api"
 
-	slog.Info("Wakapi", "version", version)
+	slog.Info("Wakapi", "version", config.Version)
 
 	// Set up GORM
 	gormLogger := logger.New(
@@ -173,12 +174,14 @@ func main() {
 	diagnosticsRepository = repositories.NewDiagnosticsRepository(db)
 	metricsRepository = repositories.NewMetricsRepository(db)
 	durationRepository = repositories.NewDurationRepository(db)
+	apiKeyRepository = repositories.NewApiKeyRepository(db)
 
 	// Services
 	mailService = mail.NewMailService()
 	aliasService = services.NewAliasService(aliasRepository)
 	keyValueService = services.NewKeyValueService(keyValueRepository)
-	userService = services.NewUserService(keyValueService, mailService, userRepository)
+	apiKeyService = services.NewApiKeyService(apiKeyRepository)
+	userService = services.NewUserService(keyValueService, mailService, apiKeyService, userRepository)
 	languageMappingService = services.NewLanguageMappingService(languageMappingRepository)
 	projectLabelService = services.NewProjectLabelService(projectLabelRepository)
 	heartbeatService = services.NewHeartbeatService(heartbeatRepository, languageMappingService)
@@ -229,17 +232,20 @@ func main() {
 	wakatimeV1ProjectsHandler := wtV1Routes.NewProjectsHandler(userService, heartbeatService)
 	wakatimeV1HeartbeatsHandler := wtV1Routes.NewHeartbeatHandler(userService, heartbeatService)
 	wakatimeV1LeadersHandler := wtV1Routes.NewLeadersHandler(userService, leaderboardService)
+	wakatimeV1UserAgentsHandler := wtV1Routes.NewUserAgentsHandler(userService, heartbeatService)
 	shieldV1BadgeHandler := shieldsV1Routes.NewBadgeHandler(summaryService, userService)
 
 	// MVC Handlers
-	summaryHandler := routes.NewSummaryHandler(summaryService, userService, keyValueService, durationService, aliasService)
-	settingsHandler := routes.NewSettingsHandler(userService, heartbeatService, durationService, summaryService, aliasService, aggregationService, languageMappingService, projectLabelService, keyValueService, mailService)
+	summaryHandler := routes.NewSummaryHandler(summaryService, userService, heartbeatService, durationService, aliasService)
+	settingsHandler := routes.NewSettingsHandler(userService, heartbeatService, durationService, summaryService, aliasService, aggregationService, languageMappingService, projectLabelService, keyValueService, mailService, apiKeyService)
 	subscriptionHandler := routes.NewSubscriptionHandler(userService, mailService, keyValueService)
 	projectsHandler := routes.NewProjectsHandler(userService, heartbeatService)
 	homeHandler := routes.NewHomeHandler(userService, keyValueService)
 	loginHandler := routes.NewLoginHandler(userService, mailService, keyValueService)
 	imprintHandler := routes.NewImprintHandler(keyValueService)
+	setupHandler := routes.NewSetupHandler(userService)
 	leaderboardHandler := condition.Ternary[bool, routes.Handler](config.App.LeaderboardEnabled, routes.NewLeaderboardHandler(userService, leaderboardService), routes.NewNoopHandler())
+	miscHandler := routes.NewMiscHandler(userService)
 
 	// Other Handlers
 	relayHandler := relay.NewRelayHandler()
@@ -250,7 +256,7 @@ func main() {
 		middleware.CleanPath,
 		middleware.StripSlashes,
 		middleware.Recoverer,
-		middlewares.NewPrincipalMiddleware(),
+		middlewares.NewSharedDataMiddleware(),
 		middlewares.NewLoggingMiddleware(slog.Info, []string{
 			"/assets",
 			"/favicon",
@@ -277,12 +283,14 @@ func main() {
 	homeHandler.RegisterRoutes(rootRouter)
 	loginHandler.RegisterRoutes(rootRouter)
 	imprintHandler.RegisterRoutes(rootRouter)
+	setupHandler.RegisterRoutes(rootRouter)
 	summaryHandler.RegisterRoutes(rootRouter)
 	leaderboardHandler.RegisterRoutes(rootRouter)
 	projectsHandler.RegisterRoutes(rootRouter)
 	settingsHandler.RegisterRoutes(rootRouter)
 	subscriptionHandler.RegisterRoutes(rootRouter)
 	relayHandler.RegisterRoutes(rootRouter)
+	miscHandler.RegisterRoutes(rootRouter)
 
 	// API route registrations
 	rootApiHandler.RegisterRoutes(apiRouter)
@@ -302,6 +310,7 @@ func main() {
 	wakatimeV1ProjectsHandler.RegisterRoutes(apiRouter)
 	wakatimeV1HeartbeatsHandler.RegisterRoutes(apiRouter)
 	wakatimeV1LeadersHandler.RegisterRoutes(apiRouter)
+	wakatimeV1UserAgentsHandler.RegisterRoutes(apiRouter)
 	shieldV1BadgeHandler.RegisterRoutes(apiRouter)
 	captchaHandler.RegisterRoutes(apiRouter)
 
@@ -375,11 +384,15 @@ func listen(handler http.Handler) {
 	}
 
 	if config.UseTLS() {
-		if s4 != nil {
+		if s4 != nil && !utils.IPv4HandledByDualStackHttp(s4, s6) { // https://github.com/muety/wakapi/issues/860
 			slog.Info("👉 Listening for HTTPS... ✅", "address", s4.Addr)
 			go func() {
 				if err := s4.ListenAndServeTLS(config.Server.TlsCertPath, config.Server.TlsKeyPath); err != nil {
-					conf.Log().Fatal(err.Error())
+					err := err.Error()
+					if s6 != nil {
+						err += " - possibly a dual-stack problem (https://github.com/muety/wakapi/issues/860)?"
+					}
+					conf.Log().Fatal(err)
 				}
 			}()
 		}
@@ -407,11 +420,15 @@ func listen(handler http.Handler) {
 			}()
 		}
 	} else {
-		if s4 != nil {
+		if s4 != nil && !utils.IPv4HandledByDualStackHttp(s4, s6) { // https://github.com/muety/wakapi/issues/860
 			slog.Info("👉 Listening for HTTP... ✅", "address", s4.Addr)
 			go func() {
 				if err := s4.ListenAndServe(); err != nil {
-					conf.Log().Fatal(err.Error())
+					err := err.Error()
+					if s6 != nil {
+						err += " - possibly a dual-stack problem (https://github.com/muety/wakapi/issues/860)?"
+					}
+					conf.Log().Fatal(err)
 				}
 			}()
 		}

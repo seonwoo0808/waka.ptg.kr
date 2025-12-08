@@ -2,7 +2,11 @@ package services
 
 import (
 	"errors"
+	"log/slog"
+	"time"
+
 	"github.com/duke-git/lancet/v2/condition"
+	datastructure "github.com/duke-git/lancet/v2/datastructure/set"
 	"github.com/duke-git/lancet/v2/datetime"
 	"github.com/duke-git/lancet/v2/maputil"
 	"github.com/duke-git/lancet/v2/slice"
@@ -12,8 +16,6 @@ import (
 	"github.com/muety/wakapi/config"
 	"github.com/muety/wakapi/models"
 	"github.com/muety/wakapi/repositories"
-	"log/slog"
-	"time"
 )
 
 const heartbeatPadding = 0 * time.Second
@@ -28,6 +30,7 @@ type DurationService struct {
 	languageMappingService ILanguageMappingService
 	lastUserJob            map[string]time.Time
 	queue                  *artifex.Dispatcher
+	pending                datastructure.Set[string] // currently running per-user regeneration jobs
 }
 
 func NewDurationService(durationRepository repositories.IDurationRepository, heartbeatService IHeartbeatService, userService IUserService, languageMappingService ILanguageMappingService) *DurationService {
@@ -40,6 +43,7 @@ func NewDurationService(durationRepository repositories.IDurationRepository, hea
 		repository:             durationRepository,
 		lastUserJob:            make(map[string]time.Time),
 		queue:                  config.GetQueue(config.QueueProcessing),
+		pending:                datastructure.New[string](),
 	}
 
 	// TODO: refactor to updating durations on-the-fly as heartbeats flow in, instead of batch-wise
@@ -66,11 +70,11 @@ func (srv *DurationService) Get(from, to time.Time, user *models.User, filters *
 	// while durations themselves store the interval (aka. heartbeats timeout) they were computed for, we currently don't support actually storing durations at different intervals
 	// if an interval different from the user's preference is requested, recompute durations live from heartbeats and skip cache
 	effectiveTimeout := getEffectiveTimeout(user, customTimeout)
-	skipCache = skipCache || effectiveTimeout != user.HeartbeatsTimeout()
+	skipCache = skipCache || effectiveTimeout != user.HeartbeatsTimeout() || filters.IsProjectDetails() // related: https://github.com/muety/wakapi/issues/876
 
 	// recompute live
 	if skipCache {
-		durations, err = srv.getLive(from, to, user, effectiveTimeout)
+		durations, err = srv.getLive(from, to, user, effectiveTimeout, filters.IsProjectDetails())
 		if err != nil {
 			return nil, err
 		}
@@ -92,7 +96,7 @@ func (srv *DurationService) Get(from, to time.Time, user *models.User, filters *
 			from = cached.Last().TimeEnd().Add(time.Second)
 		}
 
-		missing, err := srv.getLive(from, to, user, effectiveTimeout)
+		missing, err := srv.getLive(from, to, user, effectiveTimeout, filters.IsProjectDetails())
 		if err != nil {
 			return nil, err
 		}
@@ -108,6 +112,13 @@ func (srv *DurationService) Get(from, to time.Time, user *models.User, filters *
 }
 
 func (srv *DurationService) Regenerate(user *models.User, forceAll bool) {
+	if srv.pending.Contain(user.ID) {
+		config.Log().Warn("skipping regeneration of durations for user, because already running", "user", user.ID)
+		return
+	}
+	srv.pending.Add(user.ID)
+	defer srv.pending.Delete(user.ID)
+
 	var from time.Time
 	latest, err := srv.repository.GetLatestByUser(user)
 	if err == nil && latest != nil && !forceAll {
@@ -170,7 +181,7 @@ func (srv *DurationService) getCached(from, to time.Time, user *models.User, fil
 	return models.Durations(durations).Augmented(languageMappings).Sorted(), nil
 }
 
-func (srv *DurationService) getLive(from, to time.Time, user *models.User, interval time.Duration) (models.Durations, error) {
+func (srv *DurationService) getLive(from, to time.Time, user *models.User, interval time.Duration, includeEntities bool) (models.Durations, error) {
 	heartbeatsTimeout := interval
 
 	heartbeats, err := srv.heartbeatService.StreamAllWithin(from, to, user)
@@ -181,9 +192,8 @@ func (srv *DurationService) getLive(from, to time.Time, user *models.User, inter
 	// Aggregation
 	// The below logic is approximately (no filtering, no "same day"-check) equivalent to the SQL query at scripts/aggregate_durations_mysql.sql.
 	// A Postgres-compatible script was contributed by @cwilby and is available at scripts/aggregate_durations_postgres.sql
-	// I'm hesitant to replicate that logic for sqlite and mssql too (because probably painful to impossible), but we could
-	// think about adding a distinction here to use pure-sql aggregation for MySQL and Postgres, and traditional, programmatic
-	// aggregation for all other databases.
+	// I'm hesitant to replicate that logic for sqlite (because probably painful to impossible), but we could think about
+	// adding a distinction here to use pure-sql aggregation for MySQL and Postgres, and traditional, programmatic aggregation for all other databases.
 	var count int
 	var latest *models.Duration
 
@@ -195,7 +205,11 @@ func (srv *DurationService) getLive(from, to time.Time, user *models.User, inter
 			h.User = user
 		}
 
-		d1 := models.NewDurationFromHeartbeat(h).WithEntityIgnored().WithTimeout(interval).Hashed()
+		d1 := models.NewDurationFromHeartbeat(h).WithTimeout(interval)
+		if !includeEntities { // related to https://github.com/muety/wakapi/issues/876
+			d1 = d1.WithEntityIgnored()
+		}
+		d1 = d1.Hashed()
 
 		// initialize map entry
 		if list, ok := mapping[d1.GroupHash]; !ok || len(list) < 1 {
@@ -244,6 +258,7 @@ func (srv *DurationService) getLive(from, to time.Time, user *models.User, inter
 		durations[0].Duration = heartbeatPadding
 	}
 
+	// note: no need to do language augmentation here, because already done while retrieving heartbeats
 	return models.Durations(durations).Sorted(), nil
 }
 

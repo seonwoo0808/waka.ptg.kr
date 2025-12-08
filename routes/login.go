@@ -9,6 +9,8 @@ import (
 	"time"
 
 	"github.com/dchest/captcha"
+	"github.com/duke-git/lancet/v2/random"
+	"github.com/duke-git/lancet/v2/slice"
 	"github.com/go-chi/chi/v5"
 	"github.com/go-chi/httprate"
 	conf "github.com/muety/wakapi/config"
@@ -19,6 +21,8 @@ import (
 	"github.com/muety/wakapi/services"
 	"github.com/muety/wakapi/utils"
 )
+
+// TODO(oidc): tests (not only for oidc, but login in general)
 
 type LoginHandler struct {
 	config       *conf.Config
@@ -51,6 +55,8 @@ func (h *LoginHandler) RegisterRoutes(router chi.Router) {
 	router.
 		With(httprate.LimitByRealIP(h.config.Security.GetPasswordResetMaxRate())).
 		Post("/reset-password", h.PostResetPassword)
+	router.Get("/oidc/{provider}/login", h.GetOidcLogin)
+	router.Get("/oidc/{provider}/callback", h.GetOidcCallback)
 
 	authMiddleware := middlewares.NewAuthenticateMiddleware(h.userSrvc).
 		WithRedirectTarget(defaultErrorRedirectTarget()).
@@ -92,7 +98,7 @@ func (h *LoginHandler) PostLogin(w http.ResponseWriter, r *http.Request) {
 		templates[conf.LoginTemplate].Execute(w, h.buildViewModel(r, w, false).WithError("missing parameters"))
 		return
 	}
-	if err := loginDecoder.Decode(&login, r.PostForm); err != nil {
+	if err := loginDecoder.Decode(&login, r.PostForm); err != nil || login.Username == "" || login.Password == "" {
 		w.WriteHeader(http.StatusBadRequest)
 		templates[conf.LoginTemplate].Execute(w, h.buildViewModel(r, w, false).WithError("missing parameters"))
 		return
@@ -100,9 +106,12 @@ func (h *LoginHandler) PostLogin(w http.ResponseWriter, r *http.Request) {
 
 	user, err := h.userSrvc.GetUserById(login.Username)
 	if err != nil {
-		w.WriteHeader(http.StatusNotFound)
-		templates[conf.LoginTemplate].Execute(w, h.buildViewModel(r, w, false).WithError("resource not found"))
-		return
+		// try to get by email if given username is an email address (checked inside service)
+		if user, err = h.userSrvc.GetUserByEmail(login.Username); err != nil {
+			w.WriteHeader(http.StatusNotFound)
+			templates[conf.LoginTemplate].Execute(w, h.buildViewModel(r, w, false).WithError("resource not found"))
+			return
+		}
 	}
 
 	if !utils.ComparePassword(user.Password, login.Password, h.config.Security.PasswordSalt) {
@@ -111,18 +120,7 @@ func (h *LoginHandler) PostLogin(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	encoded, err := h.config.Security.SecureCookie.Encode(models.AuthCookieKey, login.Username)
-	if err != nil {
-		w.WriteHeader(http.StatusInternalServerError)
-		conf.Log().Request(r).Error("failed to encode secure cookie", "error", err)
-		templates[conf.LoginTemplate].Execute(w, h.buildViewModel(r, w, false).WithError("internal server error"))
-		return
-	}
-
-	user.LastLoggedInAt = models.CustomTime(time.Now())
-	h.userSrvc.Update(user)
-
-	http.SetCookie(w, h.config.CreateCookie(models.AuthCookieKey, encoded))
+	h.finishUserLogin(user, r, w)
 	http.Redirect(w, r, fmt.Sprintf("%s/summary", h.config.Server.BasePath), http.StatusFound)
 }
 
@@ -134,7 +132,8 @@ func (h *LoginHandler) PostLogout(w http.ResponseWriter, r *http.Request) {
 	if user := middlewares.GetPrincipal(r); user != nil {
 		h.userSrvc.FlushUserCache(user.ID)
 	}
-	http.SetCookie(w, h.config.GetClearCookie(models.AuthCookieKey))
+	routeutils.ClearSession(r, w)                                    // clear all session data
+	http.SetCookie(w, h.config.GetClearCookie(models.AuthCookieKey)) // clear auth token
 	http.Redirect(w, r, fmt.Sprintf("%s/", h.config.Server.BasePath), http.StatusFound)
 }
 
@@ -183,14 +182,16 @@ func (h *LoginHandler) PostSignup(w http.ResponseWriter, r *http.Request) {
 	var invitedDate time.Time
 	var inviteCodeKey = fmt.Sprintf("%s_%s", conf.KeyInviteCode, signup.InviteCode)
 
-	if kv, _ := h.keyValueSrvc.GetString(inviteCodeKey); kv != nil && kv.Value != "" {
-		if parts := strings.Split(kv.Value, ","); len(parts) == 2 {
-			invitedBy = parts[0]
-			invitedDate, _ = time.Parse(time.RFC3339, parts[1])
-		}
+	if signup.InviteCode != "" {
+		if kv, _ := h.keyValueSrvc.GetString(inviteCodeKey); kv != nil && kv.Value != "" {
+			if parts := strings.Split(kv.Value, ","); len(parts) == 2 {
+				invitedBy = parts[0]
+				invitedDate, _ = time.Parse(time.RFC3339, parts[1])
+			}
 
-		if err := h.keyValueSrvc.DeleteString(inviteCodeKey); err != nil {
-			conf.Log().Error("failed to revoke invite code", "inviteCodeKey", inviteCodeKey, "error", err)
+			if err := h.keyValueSrvc.DeleteString(inviteCodeKey); err != nil {
+				conf.Log().Error("failed to revoke invite code", "inviteCodeKey", inviteCodeKey, "error", err)
+			}
 		}
 	}
 
@@ -218,7 +219,7 @@ func (h *LoginHandler) PostSignup(w http.ResponseWriter, r *http.Request) {
 	if err != nil {
 		w.WriteHeader(http.StatusInternalServerError)
 		conf.Log().Request(r).Error("failed to create new user", "error", err)
-		templates[conf.SignupTemplate].Execute(w, h.buildViewModel(r, w, h.config.Security.SignupCaptcha).WithError("failed to create new user"))
+		templates[conf.SignupTemplate].Execute(w, h.buildViewModel(r, w, h.config.Security.SignupCaptcha).WithError("failed to create new user (username or e-mail already existing?)"))
 		return
 	}
 	if !created {
@@ -335,6 +336,13 @@ func (h *LoginHandler) PostResetPassword(w http.ResponseWriter, r *http.Request)
 	}
 
 	if user, err := h.userSrvc.GetUserByEmail(resetRequest.Email); user != nil && err == nil {
+		if user.AuthType != "local" {
+			conf.Log().Request(r).Warn("non-local user tried to reset password", "user", user.ID)
+			w.WriteHeader(http.StatusInternalServerError)
+			templates[conf.ResetPasswordTemplate].Execute(w, h.buildViewModel(r, w, false).WithError("failed to proceed with password reset"))
+			return
+		}
+
 		if u, err := h.userSrvc.GenerateResetToken(user); err != nil {
 			w.WriteHeader(http.StatusInternalServerError)
 			conf.Log().Request(r).Error("failed to generate password reset token", "error", err)
@@ -358,6 +366,111 @@ func (h *LoginHandler) PostResetPassword(w http.ResponseWriter, r *http.Request)
 	http.Redirect(w, r, h.config.Server.BasePath, http.StatusFound)
 }
 
+func (h *LoginHandler) GetOidcLogin(w http.ResponseWriter, r *http.Request) {
+	provider := h.getOidcProvider(w, r)
+	if provider == nil {
+		return // redirect done in previous method
+	}
+	state := routeutils.SetNewOidcState(r, w) // encoding state into session is fine, because session cookie is encrypted
+	http.Redirect(w, r, provider.OAuth2.AuthCodeURL(state), http.StatusFound)
+}
+
+func (h *LoginHandler) GetOidcCallback(w http.ResponseWriter, r *http.Request) {
+	provider := h.getOidcProvider(w, r)
+	if provider == nil {
+		return // redirect done in previous method
+	}
+
+	code := r.URL.Query().Get("code")
+	state := r.URL.Query().Get("state")
+
+	// clear any existing id token on the session, just because
+	routeutils.ClearOidcIdTokenPayload(r, w)
+
+	// validate oauth state param
+	savedState := routeutils.GetOidcState(r)
+	if state == "" || savedState != state {
+		errMsg := "suspicious operation, got invalid state in oidc callback"
+		conf.Log().Request(r).Error(errMsg, "saved_state", savedState, "state", state, "provider", provider.Name)
+		routeutils.SetError(r, w, errMsg)
+		http.Redirect(w, r, fmt.Sprintf("%s/login", h.config.Server.BasePath), http.StatusFound)
+		return
+	}
+	routeutils.ClearOidcState(r, w)
+
+	// exchange auth code for access token and id token
+	authToken, err := provider.OAuth2.Exchange(r.Context(), code)
+	if err != nil {
+		errMsg := "failed to exchange authorization code for access token"
+		conf.Log().Request(r).Error(errMsg, "provider", provider.Name)
+		routeutils.SetError(r, w, errMsg)
+		http.Redirect(w, r, fmt.Sprintf("%s/login", h.config.Server.BasePath), http.StatusFound)
+		return
+	}
+
+	// extract id token
+	rawIdToken, ok := authToken.Extra("id_token").(string)
+	if !ok {
+		errMsg := "failed to extract id_token"
+		conf.Log().Request(r).Error(errMsg, "provider", provider.Name)
+		routeutils.SetError(r, w, errMsg)
+		http.Redirect(w, r, fmt.Sprintf("%s/login", h.config.Server.BasePath), http.StatusFound)
+		return
+	}
+
+	// verify id token
+	idTokenPayload, err := routeutils.DecodeOidcIdToken(rawIdToken, provider, r.Context())
+	if err != nil || idTokenPayload == nil {
+		errMsg := "failed to verify and decode id_token"
+		conf.Log().Request(r).Error(errMsg, "provider", provider.Name, "id_token", rawIdToken) // save to log, because does not grant any access
+		routeutils.SetError(r, w, errMsg)
+		http.Redirect(w, r, fmt.Sprintf("%s/login", h.config.Server.BasePath), http.StatusFound)
+		return
+	}
+
+	user, err := h.userSrvc.GetUserByOidc(provider.Name, idTokenPayload.Subject)
+	if err != nil {
+		// create new user account
+		if !h.config.IsDev() && !h.config.Security.OidcAllowSignup {
+			routeutils.SetError(r, w, "registration is disabled on this server")
+			http.Redirect(w, r, fmt.Sprintf("%s/login", h.config.Server.BasePath), http.StatusFound)
+			return
+		}
+
+		signup := models.SignupFromOidcIdToken(idTokenPayload)
+		if !signup.IsValid() {
+			routeutils.SetError(r, w, "invalid parameters (invalid username?)")
+			http.Redirect(w, r, fmt.Sprintf("%s/login", h.config.Server.BasePath), http.StatusFound)
+			return
+		}
+
+		if newUsername := h.coalesceExistingUser(signup.Username); newUsername != signup.Username {
+			slog.Warn("username from id token already exist, using suffixed one instead", "username", newUsername)
+			signup.Username = newUsername
+		}
+
+		slog.Info("creating new user from successful oidc authentication",
+			"provider", signup.OidcProvider,
+			"username", signup.Username,
+			"email", signup.Email,
+			"sub", signup.OidcSubject,
+		)
+
+		newUser, created, err := h.userSrvc.CreateOrGet(signup, false)
+		if err != nil || !created {
+			conf.Log().Request(r).Error("failed to create new user", "error", err, "provider", signup.OidcProvider, "username", signup.Username, "email", signup.Email)
+			routeutils.SetError(r, w, "failed to create new user (username or e-mail already existing?)")
+			http.Redirect(w, r, fmt.Sprintf("%s/login", h.config.Server.BasePath), http.StatusFound)
+			return
+		}
+		user = newUser
+	}
+
+	routeutils.SetOidcIdTokenPayload(idTokenPayload, r, w) // save to session, only used by middleware for automatic redirection upon expiry
+	h.finishUserLogin(user, r, w)
+	http.Redirect(w, r, fmt.Sprintf("%s/summary", h.config.Server.BasePath), http.StatusFound)
+}
+
 func (h *LoginHandler) buildViewModel(r *http.Request, w http.ResponseWriter, withCaptcha bool) *view.LoginViewModel {
 	numUsers, _ := h.userSrvc.Count()
 
@@ -366,6 +479,13 @@ func (h *LoginHandler) buildViewModel(r *http.Request, w http.ResponseWriter, wi
 		TotalUsers:      int(numUsers),
 		AllowSignup:     h.config.IsDev() || h.config.Security.AllowSignup,
 		InviteCode:      r.URL.Query().Get("invite"),
+		OidcProviders: slice.Map(h.config.Security.ListOidcProviders(), func(i int, providerName string) view.LoginViewModelOidcProvider {
+			provider, _ := conf.GetOidcProvider(providerName) // no error, because only using registered provider names
+			return view.LoginViewModelOidcProvider{
+				Name:        provider.Name,
+				DisplayName: provider.DisplayName,
+			}
+		}),
 	}
 
 	if withCaptcha {
@@ -373,4 +493,37 @@ func (h *LoginHandler) buildViewModel(r *http.Request, w http.ResponseWriter, wi
 	}
 
 	return routeutils.WithSessionMessages(vm, r, w)
+}
+
+func (h *LoginHandler) getOidcProvider(w http.ResponseWriter, r *http.Request) *conf.OidcProvider {
+	providerName := chi.URLParam(r, "provider")
+	provider, err := conf.GetOidcProvider(providerName)
+	if err != nil {
+		routeutils.SetError(r, w, fmt.Sprintf("oidc provider \"%s\" not registered", providerName))
+		http.Redirect(w, r, fmt.Sprintf("%s/login", h.config.Server.BasePath), http.StatusFound)
+		return nil
+	}
+	return provider
+}
+
+func (h *LoginHandler) finishUserLogin(user *models.User, r *http.Request, w http.ResponseWriter) {
+	encoded, err := h.config.Security.SecureCookie.Encode(models.AuthCookieKey, user.ID)
+	if err != nil {
+		w.WriteHeader(http.StatusInternalServerError)
+		conf.Log().Request(r).Error("failed to encode secure cookie", "error", err)
+		templates[conf.LoginTemplate].Execute(w, h.buildViewModel(r, w, false).WithError("internal server error"))
+		return
+	}
+
+	user.LastLoggedInAt = models.CustomTime(time.Now())
+	h.userSrvc.Update(user)
+
+	http.SetCookie(w, h.config.CreateCookie(models.AuthCookieKey, encoded))
+}
+
+func (h *LoginHandler) coalesceExistingUser(username string) string {
+	if u, _ := h.userSrvc.GetUserById(username); u != nil {
+		return fmt.Sprintf("%s-%s", username, strings.ToLower(random.RandString(6)))
+	}
+	return username
 }

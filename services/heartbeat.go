@@ -2,6 +2,11 @@ package services
 
 import (
 	"fmt"
+	"math"
+	"strings"
+	"sync"
+	"time"
+
 	datastructure "github.com/duke-git/lancet/v2/datastructure/set"
 	"github.com/duke-git/lancet/v2/maputil"
 	"github.com/leandro-lugaresi/hub"
@@ -9,10 +14,6 @@ import (
 	"github.com/muety/wakapi/repositories"
 	"github.com/muety/wakapi/utils"
 	"github.com/patrickmn/go-cache"
-	"math"
-	"strings"
-	"sync"
-	"time"
 
 	"github.com/muety/wakapi/models"
 )
@@ -46,6 +47,7 @@ func NewHeartbeatService(heartbeatRepo repositories.IHeartbeatRepository, langua
 			srv.cache.IncrementInt64(srv.countByUserCacheKey(heartbeat.UserID), 1) // increment doesn't update expiration time
 			srv.cache.IncrementInt64(srv.countTotalCacheKey(), 1)
 			srv.checkInvalidateProjectStatsCache(heartbeat)
+			srv.checkInvalidateRangeCache(heartbeat)
 		}
 	}(&sub1)
 
@@ -189,8 +191,46 @@ func (srv *HeartbeatService) GetLatestByFilters(user *models.User, filters *mode
 	return srv.repository.GetLatestByFilters(user, srv.filtersToColumnMap(filters))
 }
 
-func (srv *HeartbeatService) GetFirstByUsers() ([]*models.TimeByUser, error) {
-	return srv.repository.GetFirstByUsers()
+func (srv *HeartbeatService) GetFirstAll() ([]*models.TimeByUser, error) {
+	return srv.repository.GetFirstAll()
+}
+
+func (srv *HeartbeatService) GetLastAll() ([]*models.TimeByUser, error) {
+	return srv.repository.GetLastAll()
+}
+
+func (srv *HeartbeatService) GetFirstByUser(user *models.User) (time.Time, error) {
+	cacheKey := srv.getUserFirstCacheKey(user.ID)
+	if result, found := srv.cache.Get(cacheKey); found {
+		return result.(time.Time), nil
+	}
+
+	result, err := srv.repository.GetRangeByUser(user)
+	if err != nil {
+		return time.Time{}, err
+	}
+
+	srv.cache.Set(cacheKey, result.First.T(), cache.NoExpiration)
+	return result.First.T(), nil
+}
+
+func (srv *HeartbeatService) GetLastByUser(user *models.User) (time.Time, error) {
+	cacheKey := srv.getUserLastCacheKey(user.ID)
+	if result, found := srv.cache.Get(cacheKey); found {
+		return result.(time.Time), nil
+	}
+
+	result, err := srv.repository.GetRangeByUser(user)
+	if err != nil {
+		return time.Time{}, err
+	}
+
+	srv.cache.Set(cacheKey, result.Last.T(), cache.NoExpiration)
+	return result.Last.T(), nil
+}
+
+func (srv *HeartbeatService) GetRangeByUser(user *models.User) (*models.RangeByUser, error) {
+	return srv.repository.GetRangeByUser(user)
 }
 
 func (srv *HeartbeatService) GetEntitySetByUser(entityType uint8, userId string) ([]string, error) {
@@ -266,6 +306,18 @@ func (srv *HeartbeatService) GetUserProjectStats(user *models.User, from, to tim
 	return results, err
 }
 
+// GetUserAgentsByUser returns a list of all user agents that have been recorded for the given user.
+func (srv *HeartbeatService) GetUserAgentsByUser(user *models.User) ([]*models.UserAgent, error) {
+	userAgents, err := srv.repository.GetUserAgentsByUser(user)
+	if err != nil {
+		return nil, err
+	}
+	for _, ua := range userAgents {
+		ua.WithId()
+	}
+	return userAgents, nil
+}
+
 func (srv *HeartbeatService) augmented(heartbeats []*models.Heartbeat, userId string) ([]*models.Heartbeat, error) {
 	languageMapping, err := srv.languageMappingSrvc.ResolveByUser(userId)
 	if err != nil {
@@ -296,6 +348,14 @@ func (srv *HeartbeatService) getEntityUserCacheKey(entityType uint8, userId stri
 
 func (srv *HeartbeatService) getUserProjectsCacheKey(userId string) string {
 	return fmt.Sprintf("unique_projects_%s", userId)
+}
+
+func (srv *HeartbeatService) getUserFirstCacheKey(userId string) string {
+	return fmt.Sprintf("user_first_%s", userId)
+}
+
+func (srv *HeartbeatService) getUserLastCacheKey(userId string) string {
+	return fmt.Sprintf("user_last_%s", userId)
 }
 
 func (srv *HeartbeatService) updateEntityUserCache(entityType uint8, entityKey string, userId string) {
@@ -379,5 +439,19 @@ func (srv *HeartbeatService) checkInvalidateProjectStatsCache(newHeartbeat *mode
 	}
 	if invalidated {
 		go srv.populateUniqueUserProjects(newHeartbeat.UserID)
+	}
+}
+
+func (srv *HeartbeatService) checkInvalidateRangeCache(newHeartbeat *models.Heartbeat) {
+	keyFirst, keyLast := srv.getUserFirstCacheKey(newHeartbeat.UserID), srv.getUserLastCacheKey(newHeartbeat.UserID)
+
+	first, found := srv.cache.Get(keyFirst)
+	if found && newHeartbeat.Time.T().Before(first.(time.Time)) {
+		srv.cache.Delete(keyFirst)
+	}
+
+	last, found := srv.cache.Get(keyLast)
+	if found && newHeartbeat.Time.T().After(last.(time.Time)) {
+		srv.cache.Delete(keyLast)
 	}
 }

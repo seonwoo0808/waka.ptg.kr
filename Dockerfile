@@ -8,7 +8,7 @@ COPY ./go.mod ./go.sum ./
 RUN go mod download
 COPY . .
 
-RUN GOOS=linux GOARCH=amd64 CGO_ENABLED=0 go build -ldflags "-s -w" -v -o wakapi main.go
+RUN GOOS=linux GOARCH=amd64 CGO_ENABLED=0 GOEXPERIMENT=greenteagc,jsonv2 go build -ldflags "-s -w" -v -o wakapi main.go
 
 WORKDIR /staging
 RUN mkdir ./data ./app && \

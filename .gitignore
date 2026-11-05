@@ -1,6 +1,8 @@
 launch.json
 .vscode
 wakapi
+healthcheck
+dbmigrate
 .idea
 build
 *.exe
@@ -20,3 +22,7 @@ scripts/mysql_to_*.yml
 *.db-journal
 *.db-shm
 *.db-wal
+*.db*.gz
+**/__pycache__
+go.work
+go.work.sum

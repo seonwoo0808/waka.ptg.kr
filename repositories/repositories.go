@@ -41,8 +41,10 @@ type IHeartbeatRepository interface {
 	GetLatestByUser(*models.User) (*models.Heartbeat, error)
 	GetLatestByOriginAndUser(string, *models.User) (*models.Heartbeat, error)
 	StreamWithin(time.Time, time.Time, *models.User) (chan *models.Heartbeat, error)
+	StreamWithinExcludingHeartbeats(time.Time, time.Time, *models.User, []models.HeartbeatExclusionFilter) (chan *models.Heartbeat, error)
 	StreamWithinByFilters(time.Time, time.Time, *models.User, map[string][]string) (chan *models.Heartbeat, error)
 	StreamWithinBatched(time.Time, time.Time, *models.User, int) (chan []*models.Heartbeat, error)
+	StreamByUserBatched(*models.User, int) (chan []*models.Heartbeat, error)
 	Count(bool) (int64, error)
 	CountByUser(*models.User) (int64, error)
 	CountByUsers([]*models.User) ([]*models.CountByUser, error)
@@ -50,7 +52,7 @@ type IHeartbeatRepository interface {
 	DeleteBefore(time.Time) error
 	DeleteByUser(*models.User) error
 	DeleteByUserBefore(*models.User, time.Time) error
-	GetUserProjectStats(*models.User, time.Time, time.Time, int, int) ([]*models.ProjectStats, error)
+	GetUserProjectStats(*models.User, time.Time, time.Time) ([]*models.ProjectStats, error)
 	GetUserAgentsByUser(user *models.User) ([]*models.UserAgent, error)
 }
 
@@ -65,6 +67,7 @@ type IDurationRepository interface {
 	GetLatestByUser(*models.User) (*models.Duration, error)
 	DeleteByUser(*models.User) error
 	DeleteByUserBefore(*models.User, time.Time) error
+	DeleteByUserAfter(*models.User, time.Time) error
 }
 
 type IDiagnosticsRepository interface {
@@ -106,11 +109,15 @@ type IProjectLabelRepository interface {
 type ISummaryRepository interface {
 	IBaseRepository
 	Insert(*models.Summary) error
+	InsertWithRetry(*models.Summary) error
 	GetAll() ([]*models.Summary, error)
+	GetByUser(*models.User) ([]*models.Summary, error)
 	GetByUserWithin(*models.User, time.Time, time.Time) ([]*models.Summary, error)
 	GetLastByUser() ([]*models.TimeByUser, error)
+	GetLastBySingleUser(string) (time.Time, error)
 	DeleteByUser(string) error
 	DeleteByUserBefore(string, time.Time) error
+	DeleteByUserAfter(string, time.Time) error
 }
 
 type IUserRepository interface {
@@ -151,4 +158,13 @@ type IApiKeyRepository interface {
 	GetByApiKey(string, bool) (*models.ApiKey, error)
 	Insert(*models.ApiKey) (*models.ApiKey, error)
 	Delete(string) error
+}
+
+type IWebAuthnRepository interface {
+	IBaseRepository
+	Insert(*models.WebAuthnCredential) (*models.WebAuthnCredential, error)
+	GetByUser(string) ([]*models.WebAuthnCredential, error)
+	GetByUserAndName(string, string) (*models.WebAuthnCredential, error)
+	Update(*models.WebAuthnCredential) error
+	Delete(*models.WebAuthnCredential) error
 }

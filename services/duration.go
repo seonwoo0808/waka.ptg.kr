@@ -2,7 +2,9 @@ package services
 
 import (
 	"errors"
+	"fmt"
 	"log/slog"
+	"sync"
 	"time"
 
 	"github.com/duke-git/lancet/v2/condition"
@@ -16,6 +18,7 @@ import (
 	"github.com/muety/wakapi/config"
 	"github.com/muety/wakapi/models"
 	"github.com/muety/wakapi/repositories"
+	"github.com/patrickmn/go-cache"
 )
 
 const heartbeatPadding = 0 * time.Second
@@ -29,7 +32,9 @@ type DurationService struct {
 	userService            IUserService
 	languageMappingService ILanguageMappingService
 	lastUserJob            map[string]time.Time
+	dirtyFrom              *cache.Cache // earliest heartbeat per user after which no durations exist yet
 	queue                  *artifex.Dispatcher
+	pendingLock            sync.Mutex
 	pending                datastructure.Set[string] // currently running per-user regeneration jobs
 }
 
@@ -41,18 +46,31 @@ func NewDurationService(durationRepository repositories.IDurationRepository, hea
 		userService:            userService,
 		languageMappingService: languageMappingService,
 		repository:             durationRepository,
+		dirtyFrom:              cache.New(6*time.Hour, 12*time.Hour),
 		lastUserJob:            make(map[string]time.Time),
 		queue:                  config.GetQueue(config.QueueProcessing),
 		pending:                datastructure.New[string](),
 	}
 
 	// TODO: refactor to updating durations on-the-fly as heartbeats flow in, instead of batch-wise
-	sub1 := srv.eventBus.Subscribe(0, config.EventHeartbeatCreate)
+	sub1 := srv.eventBus.Subscribe(32, config.EventHeartbeatCreate)
 	go func(sub *hub.Subscription) {
 		for m := range sub.Receiver {
 			heartbeat := m.Fields[config.FieldPayload].(*models.Heartbeat)
 			user := heartbeat.User
 
+			// clear already existing durations if incoming heartbeat is older
+			// this is more or less the durations equivalent of what's being done on a summary level in the summary service's event receiver
+			dirtyFromKey := srv.getDirtyFromCacheKey(user.ID)
+			if dirtyFrom, ok := srv.dirtyFrom.Get(dirtyFromKey); !ok || heartbeat.Time.T().Before(dirtyFrom.(time.Time)) {
+				if err := srv.repository.DeleteByUserAfter(user, heartbeat.Time.T()); err != nil {
+					slog.Error("failed to delete durations newer than latest received heartbeat", "error", err, "user_id", user.ID, "heartbeat_id", heartbeat.ID)
+				} else {
+					srv.dirtyFrom.SetDefault(dirtyFromKey, heartbeat.Time.T())
+				}
+			}
+
+			// generate new durations every couple of hours
 			if t, ok := srv.lastUserJob[user.ID]; !ok || time.Now().Sub(t) > generateDurationsInterval {
 				srv.queue.Dispatch(func() {
 					srv.Regenerate(user, false)
@@ -78,7 +96,9 @@ func (srv *DurationService) Get(from, to time.Time, user *models.User, filters *
 		if err != nil {
 			return nil, err
 		}
-		return srv.filter(durations, user, filters), nil
+
+		languageMappings, _ := srv.languageMappingService.ResolveByUser(user.ID)
+		return srv.filter(durations.Augmented(languageMappings), user, filters), nil
 	}
 
 	// get cached
@@ -87,42 +107,69 @@ func (srv *DurationService) Get(from, to time.Time, user *models.User, filters *
 		config.Log().Error("failed to get cached durations", "user", user.ID, "from", from, "to", to, "error", err)
 		cached = models.Durations{}
 	}
+	durations = cached
 
 	// fill missing
 	// for simplicity, we assume no missing durations before 'from' or between 'from' and 'to'
-	if len(cached) == 0 || cached.Last().TimeEnd().Before(to) {
-		from := from
-		if len(cached) > 0 {
-			from = cached.Last().TimeEnd().Add(time.Second)
+	latestTime := srv.getLatestTime(user, cached, filters)
+	var (
+		missingFrom time.Time
+		needLive    bool
+	)
+	if latestTime.IsZero() {
+		if len(cached) == 0 {
+			missingFrom = from // everything's missing, recompute everything live from start to end (even if start is zero time)
+			needLive = true
+		}
+	} else if latestTime.Before(to) {
+		missingFrom = condition.Ternary(from.After(latestTime), from, latestTime.Add(time.Second)) // some parts are missing
+		needLive = true
+	} else {
+		//nothing missing, cache is complete
+	}
+
+	if needLive && (missingFrom.IsZero() || missingFrom.Before(to)) {
+		missing, err := srv.getLive(missingFrom, to, user, effectiveTimeout, filters.IsProjectDetails())
+		if err != nil {
+			return nil, err
 		}
 
-		missing, err := srv.getLive(from, to, user, effectiveTimeout, filters.IsProjectDetails())
-		if err != nil {
-			return nil, err
+		languageMappings, _ := srv.languageMappingService.ResolveByUser(user.ID)
+		augmented := missing.Augmented(languageMappings)
+
+		if len(cached) == 0 {
+			durations = augmented
+		} else {
+			durations, err = srv.merge(cached, augmented, user)
+			if err != nil {
+				return nil, err
+			}
 		}
-		durations, err = srv.merge(cached, missing, user)
-		if err != nil {
-			return nil, err
-		}
-	} else {
-		durations = append(durations, cached...)
 	}
 
 	return srv.filter(durations, user, filters), nil
 }
 
 func (srv *DurationService) Regenerate(user *models.User, forceAll bool) {
-	if srv.pending.Contain(user.ID) {
+	// regeneration jobs may run concurrently across queues (heartbeat event listener, aggregation, RegenerateAll)
+	if !srv.acquirePending(user.ID) {
 		config.Log().Warn("skipping regeneration of durations for user, because already running", "user", user.ID)
 		return
 	}
-	srv.pending.Add(user.ID)
-	defer srv.pending.Delete(user.ID)
+	defer srv.releasePending(user.ID)
 
 	var from time.Time
 	latest, err := srv.repository.GetLatestByUser(user)
 	if err == nil && latest != nil && !forceAll {
 		from = latest.TimeEnd()
+	}
+
+	// short-circuit regeneration for users that have neither persisted durations nor any heartbeats at all
+	if !forceAll && from.IsZero() {
+		if latestHeartbeat, err := srv.heartbeatService.GetLatestByUser(user, false); err == nil && (latestHeartbeat == nil || latestHeartbeat.Time.T().IsZero()) {
+			slog.Info("skipping duration regeneration, because user has neither durations nor heartbeats", "user", user.ID)
+			return
+		}
 	}
 
 	slog.Info("generating ephemeral durations for user up until now", "user", user.ID, "from", from)
@@ -147,6 +194,8 @@ func (srv *DurationService) Regenerate(user *models.User, forceAll bool) {
 		config.Log().Error("failed to persist new ephemeral durations for user", "user", user.ID, "error", err)
 		return
 	}
+
+	srv.dirtyFrom.Delete(srv.getDirtyFromCacheKey(user.ID))
 }
 
 func (srv *DurationService) RegenerateAll() {
@@ -169,6 +218,26 @@ func (srv *DurationService) DeleteByUser(user *models.User) error {
 	return srv.repository.DeleteByUser(user)
 }
 
+func (srv *DurationService) DeleteByUserBefore(user *models.User, t time.Time) error {
+	return srv.repository.DeleteByUserBefore(user, t)
+}
+
+func (srv *DurationService) DeleteByUserAfter(user *models.User, t time.Time) error {
+	return srv.repository.DeleteByUserAfter(user, t)
+}
+
+func (srv *DurationService) getLatestTime(user *models.User, existingDurations models.Durations, filters *models.Filters) time.Time {
+	if filters != nil && !filters.IsEmpty() {
+		if latest, err := srv.repository.GetLatestByUser(user); err == nil && latest != nil {
+			return latest.TimeEnd()
+		}
+	}
+	if len(existingDurations) > 0 {
+		return existingDurations.Last().TimeEnd()
+	}
+	return time.Time{}
+}
+
 func (srv *DurationService) getCached(from, to time.Time, user *models.User, filters *models.Filters) (models.Durations, error) {
 	languageMappings, err := srv.languageMappingService.ResolveByUser(user.ID)
 	if err != nil {
@@ -184,7 +253,7 @@ func (srv *DurationService) getCached(from, to time.Time, user *models.User, fil
 func (srv *DurationService) getLive(from, to time.Time, user *models.User, interval time.Duration, includeEntities bool) (models.Durations, error) {
 	heartbeatsTimeout := interval
 
-	heartbeats, err := srv.heartbeatService.StreamAllWithin(from, to, user)
+	heartbeats, err := srv.heartbeatService.StreamAllWithinExcludingHeartbeats(from, to, user, models.ExcludeFromDurations)
 	if err != nil {
 		return nil, err
 	}
@@ -226,7 +295,7 @@ func (srv *DurationService) getLive(from, to time.Time, user *models.User, inter
 		// Skip heartbeats that span across two adjacent summaries (assuming there are no more than 1 summary per day).
 		// This is relevant to prevent the time difference between generating summaries from raw heartbeats and aggregating pre-generated summaries.
 		// For the latter case, the very last heartbeat of a day won't be counted, so we don't want to count it here either
-		sameDay := datetime.BeginOfDay(d1.Time.T()) == datetime.BeginOfDay(latest.Time.T())
+		sameDay := datetime.BeginOfDay(d1.Time.T().In(user.TZ())).Equal(datetime.BeginOfDay(latest.Time.T().In(user.TZ())))
 		dur := condition.Ternary[bool, time.Duration](sameDay, d1.Time.T().Sub(latest.Time.T().Add(latest.Duration)), 0)
 		latest.Duration += condition.Ternary[bool, time.Duration](dur < heartbeatsTimeout, dur, heartbeatPadding)
 
@@ -310,14 +379,14 @@ func (srv *DurationService) merge(d1, d2 models.Durations, user *models.User) (m
 		} else {
 			middleLeft.Duration += diff
 			middleLeft.Hashed()
-			merged = append(merged, middleLeft) // left is extended, right is kept
+			merged = append(merged, middleLeft, middleRight) // left is extended, right is kept
 		}
 	} else {
 		merged = append(merged, middleLeft, middleRight) // both are kept as is
 	}
 
 	if len(d2) > 1 {
-		merged = append(merged, d2[1:len(d2)-1]...)
+		merged = append(merged, d2[1:]...)
 	}
 	return merged, nil
 }
@@ -337,6 +406,24 @@ func (srv *DurationService) filtersToColumnMap(filters *models.Filters) map[stri
 	}
 
 	return columnMap
+}
+
+func (srv *DurationService) acquirePending(userId string) bool {
+	srv.pendingLock.Lock()
+	defer srv.pendingLock.Unlock()
+
+	if srv.pending.Contain(userId) {
+		return false
+	}
+	srv.pending.Add(userId)
+	return true
+}
+
+func (srv *DurationService) releasePending(userId string) {
+	srv.pendingLock.Lock()
+	defer srv.pendingLock.Unlock()
+
+	srv.pending.Delete(userId)
 }
 
 func getEffectiveTimeout(user *models.User, overrideTimeout *time.Duration) time.Duration {
@@ -361,4 +448,8 @@ func updateDurationEntity(d *models.Duration, h *models.Heartbeat, entityDuratio
 		d.Entity = h.Entity
 	}
 	return d
+}
+
+func (srv *DurationService) getDirtyFromCacheKey(userId string) string {
+	return fmt.Sprintf("dirty_from_%s", userId)
 }

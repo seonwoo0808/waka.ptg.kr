@@ -3,17 +3,18 @@ package v1
 import (
 	"encoding/base64"
 	"fmt"
-	"github.com/go-chi/chi/v5"
-	"github.com/muety/wakapi/config"
-	"github.com/muety/wakapi/middlewares"
-	"github.com/muety/wakapi/mocks"
-	"github.com/muety/wakapi/models"
 	"io"
 	"net/http"
 	"net/http/httptest"
 	"strings"
 	"testing"
 	"time"
+
+	"github.com/go-chi/chi/v5"
+	"github.com/muety/wakapi/config"
+	"github.com/muety/wakapi/middlewares"
+	"github.com/muety/wakapi/mocks"
+	"github.com/muety/wakapi/models"
 )
 
 var (
@@ -51,11 +52,11 @@ func TestUsersHandler_Get(t *testing.T) {
 	userServiceMock.On("GetUserByKey", "basic-user-api-key", false).Return(basicUser, nil)
 
 	heartbeatServiceMock := new(mocks.HeartbeatServiceMock)
-	heartbeatServiceMock.On("GetLatestByUser", adminUser).Return(&models.Heartbeat{
+	heartbeatServiceMock.On("GetLatestByUser", adminUser, false).Return(&models.Heartbeat{
 		CreatedAt: models.CustomTime(time.Date(2022, 2, 2, 22, 22, 22, 5, time.UTC)),
 		Time:      models.CustomTime(time.Date(2022, 2, 2, 22, 22, 22, 6, time.UTC)),
 	}, nil)
-	heartbeatServiceMock.On("GetLatestByUser", basicUser).Return(&models.Heartbeat{
+	heartbeatServiceMock.On("GetLatestByUser", basicUser, false).Return(&models.Heartbeat{
 		CreatedAt: models.CustomTime(time.Date(2022, 2, 2, 22, 22, 22, 5, time.UTC)),
 		Time:      models.CustomTime(time.Date(2022, 2, 2, 22, 22, 22, 6, time.UTC)),
 	}, nil)
@@ -106,7 +107,7 @@ func TestUsersHandler_Get(t *testing.T) {
 
 			data, err := io.ReadAll(res.Body)
 			if err != nil {
-				t.Errorf("unextected error. Error: %s", err)
+				t.Errorf("unexpected error. Error: %s", err)
 			}
 
 			if string(data) != "401 unauthorized" {
@@ -130,7 +131,7 @@ func TestUsersHandler_Get(t *testing.T) {
 
 			data, err := io.ReadAll(res.Body)
 			if err != nil {
-				t.Errorf("unextected error. Error: %s", err)
+				t.Errorf("unexpected error. Error: %s", err)
 			}
 
 			if !strings.Contains(string(data), "\"username\":\"BasicUser\"") {

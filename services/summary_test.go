@@ -6,6 +6,8 @@ import (
 	"testing"
 	"time"
 
+	"github.com/leandro-lugaresi/hub"
+	"github.com/muety/wakapi/config"
 	"github.com/muety/wakapi/mocks"
 	"github.com/muety/wakapi/models"
 	"github.com/stretchr/testify/assert"
@@ -85,6 +87,12 @@ func (suite *SummaryServiceTestSuite) SetupSuite() {
 			ID:         uint(rand.Uint32()),
 			UserID:     TestUserId,
 			ProjectKey: TestProject1,
+			Label:      TestProjectLabel1,
+		},
+		{
+			ID:         uint(rand.Uint32()),
+			UserID:     TestUserId,
+			ProjectKey: TestProject2,
 			Label:      TestProjectLabel1,
 		},
 		{
@@ -612,10 +620,10 @@ func (suite *SummaryServiceTestSuite) TestSummaryService_Filters() {
 	suite.ProjectLabelService.On("GetByUser", suite.TestUser.ID).Return([]*models.ProjectLabel{}, nil)
 
 	from, to := suite.TestStartTime, suite.TestStartTime.Add(1*time.Hour)
-	filters := models.NewFiltersWith(models.SummaryProject, TestProject1).With(models.SummaryLabel, TestProjectLabel3)
+	filtersWithProject := models.NewFiltersWith(models.SummaryProject, TestProject1).With(models.SummaryLabel, TestProjectLabel1)
+	filtersWithoutProject := models.NewFiltersWith(models.SummaryLabel, TestProjectLabel1)
 
 	suite.DurationService.On("Get", from, to, suite.TestUser, mock.Anything, mock.Anything, false).Return(models.Durations{}, nil)
-	suite.AliasService.On("InitializeUser", TestUserId).Return(nil)
 	suite.AliasService.On("GetByUserAndKeyAndType", TestUserId, TestProject1, models.SummaryProject).Return([]*models.Alias{
 		// map any project starting with "som" to project 1
 		{
@@ -632,21 +640,33 @@ func (suite *SummaryServiceTestSuite) TestSummaryService_Filters() {
 			Value: TestProject2,
 		},
 	}, nil)
+	suite.AliasService.On("GetByUserAndKeyAndType", TestUserId, TestProject2, models.SummaryProject).Return([]*models.Alias{}, nil)
 	suite.ProjectLabelService.On("GetByUserGroupedInverted", suite.TestUser.ID).Return(map[string][]*models.ProjectLabel{
-		suite.TestLabels[0].Label: suite.TestLabels[0:1], // "private" -> ["test-project-1"]
-		suite.TestLabels[1].Label: suite.TestLabels[1:2], // "non-existing" -> ["test-project-3"]
+		suite.TestLabels[0].Label: suite.TestLabels[0:2], // "private" -> ["test-project-1", "test-project-2"]
+		suite.TestLabels[2].Label: suite.TestLabels[2:3], // "non-existing" -> ["test-project-3"]
 	}, nil).Once()
 
-	result, _ := sut.Aliased(from, to, suite.TestUser, sut.Summarize, filters, nil, false)
-	assert.NotNil(suite.T(), result.Branches) // project filters were applied -> include branches
-	assert.NotNil(suite.T(), result.Entities) // project filters were applied -> include entities
+	// first request: project details with filtering by project and label
+	// when requesting project details, don't ignore data from other projects even though they'd match the filter's label (see https://github.com/muety/wakapi/issues/883)
+	result1, _ := sut.Aliased(from, to, suite.TestUser, sut.Summarize, filtersWithProject, nil, false)
+	effectiveFilters1 := suite.DurationService.Calls[0].Arguments[3].(*models.Filters)
+	assert.NotNil(suite.T(), result1.Branches) // project filters were applied -> include branches
+	assert.NotNil(suite.T(), result1.Entities) // project filters were applied -> include entities
+	assert.Len(suite.T(), effectiveFilters1.Project, 2)
+	assert.Contains(suite.T(), effectiveFilters1.Project, TestProject1) // because actually requested
+	assert.Contains(suite.T(), effectiveFilters1.Project, TestProject4) // because of wildcard alias (whenever project 1 is requested, anything mapping to it must be included as well)
+	assert.Contains(suite.T(), effectiveFilters1.Label, TestProjectLabel1)
 
-	effectiveFilters := suite.DurationService.Calls[0].Arguments[3].(*models.Filters)
-	assert.Contains(suite.T(), effectiveFilters.Project, TestProject1) // because actually requested
-	assert.Contains(suite.T(), effectiveFilters.Project, TestProject2) // because of label via alias (whenever project 3 is requested (here as part of label), anything mapping to it must be included as well, see https://github.com/muety/wakapi/issues/836)
-	assert.Contains(suite.T(), effectiveFilters.Project, TestProject3) // because of label (directly)
-	assert.Contains(suite.T(), effectiveFilters.Project, TestProject4) // because of wildcard alias (whenever project 1 is requested, anything mapping to it must be included as well)
-	assert.Contains(suite.T(), effectiveFilters.Label, TestProjectLabel3)
+	// second request: summary with filtering by label
+	result2, _ := sut.Aliased(from, to, suite.TestUser, sut.Summarize, filtersWithoutProject, nil, false)
+	effectiveFilters2 := suite.DurationService.Calls[1].Arguments[3].(*models.Filters)
+	assert.NotNil(suite.T(), result2.Branches) // project filters were applied -> include branches
+	assert.NotNil(suite.T(), result2.Entities) // project filters were applied -> include entities
+	assert.Len(suite.T(), effectiveFilters2.Project, 3)
+	assert.Contains(suite.T(), effectiveFilters2.Project, TestProject1) // because actually requested
+	assert.Contains(suite.T(), effectiveFilters2.Project, TestProject2) // because covered by label
+	assert.Contains(suite.T(), effectiveFilters2.Project, TestProject4) // because of wildcard alias (whenever project 1 is requested, anything mapping to it must be included as well)
+	assert.Contains(suite.T(), effectiveFilters2.Label, TestProjectLabel1)
 }
 
 func (suite *SummaryServiceTestSuite) TestSummaryService_getMissingIntervals() {
@@ -686,6 +706,142 @@ func (suite *SummaryServiceTestSuite) TestSummaryService_getMissingIntervals() {
 	assert.Equal(suite.T(), from2, r5[1].End)
 	assert.Equal(suite.T(), to2, r5[2].Start)
 	assert.Equal(suite.T(), to2.Add(time.Hour), r5[2].End)
+}
+
+func (suite *SummaryServiceTestSuite) TestSummaryService_HeartbeatCreateEvent_ClearsNewerSummaries() {
+	sut, eventBus := suite.createSut()
+
+	now := time.Now()
+	latestSummaryTime := now.Add(-10 * time.Minute)
+	historicalHeartbeatTime := now.Add(-1 * time.Hour) // older than latest summary
+
+	heartbeat := &models.Heartbeat{
+		UserID: TestUserId,
+		Time:   models.CustomTime(historicalHeartbeatTime),
+	}
+
+	suite.SummaryRepository.On("GetLastBySingleUser", TestUserId).Return(latestSummaryTime, nil).Once()
+	deleted := make(chan time.Time, 1)
+	suite.SummaryRepository.On("DeleteByUserAfter", TestUserId, historicalHeartbeatTime).Return(nil).Once().Run(func(args mock.Arguments) {
+		// the listener runs in its own goroutine, so signal via channel instead of polling mock.Calls, which would race with the mock's internal bookkeeping
+		deleted <- args.Get(1).(time.Time)
+	})
+
+	eventBus.Publish(hub.Message{
+		Name: config.EventHeartbeatCreate,
+		Fields: map[string]interface{}{
+			config.FieldPayload: heartbeat,
+		},
+	})
+
+	suite.awaitDeleted(deleted, historicalHeartbeatTime)
+
+	suite.SummaryRepository.AssertExpectations(suite.T())
+	_ = sut
+}
+
+func (suite *SummaryServiceTestSuite) TestSummaryService_HeartbeatCreateEvent_KeepsSummariesForRecentHeartbeat() {
+	sut, eventBus := suite.createSut()
+
+	now := time.Now()
+	latestSummaryTime := now.Add(-1 * time.Hour)
+	recentHeartbeatTime := now // newer than latest summary
+
+	heartbeat := &models.Heartbeat{
+		UserID: TestUserId,
+		Time:   models.CustomTime(recentHeartbeatTime),
+	}
+
+	// On the first heartbeat (no cache entry yet), the handler still calls GetLatestBySingleUser
+	suite.SummaryRepository.On("GetLastBySingleUser", TestUserId).Return(latestSummaryTime, nil).Once()
+
+	eventBus.Publish(hub.Message{
+		Name: config.EventHeartbeatCreate,
+		Fields: map[string]interface{}{
+			config.FieldPayload: heartbeat,
+		},
+	})
+
+	// the heartbeat cache is written last within the listener, so it doubles as a barrier for "event fully processed"
+	// go-cache is internally synchronized, so polling it from the test is safe
+	suite.awaitProcessedHeartbeat(sut, recentHeartbeatTime)
+
+	suite.SummaryRepository.AssertNotCalled(suite.T(), "DeleteByUserAfter", mock.Anything, mock.Anything)
+	_ = sut
+}
+
+func (suite *SummaryServiceTestSuite) TestSummaryService_HeartbeatCreateEvent_SkipsCheckWhenCacheHasNewer() {
+	sut, eventBus := suite.createSut()
+
+	now := time.Now()
+	latestSummaryTime := now.Add(-2 * time.Hour)
+
+	firstHeartbeat := &models.Heartbeat{
+		UserID: TestUserId,
+		Time:   models.CustomTime(now),
+	}
+	// Second heartbeat is also "recent" (not older than the cached one) -> check should be skipped and GetLastBySingleUser should NOT be called for it
+	secondHeartbeat := &models.Heartbeat{
+		UserID: TestUserId,
+		Time:   models.CustomTime(now.Add(1 * time.Minute)),
+	}
+
+	suite.SummaryRepository.On("GetLastBySingleUser", TestUserId).Return(latestSummaryTime, nil).Once() // Only the first heartbeat should trigger the DB lookup
+
+	eventBus.Publish(hub.Message{
+		Name: config.EventHeartbeatCreate,
+		Fields: map[string]interface{}{
+			config.FieldPayload: firstHeartbeat,
+		},
+	})
+
+	suite.awaitProcessedHeartbeat(sut, now)
+
+	eventBus.Publish(hub.Message{
+		Name: config.EventHeartbeatCreate,
+		Fields: map[string]interface{}{
+			config.FieldPayload: secondHeartbeat,
+		},
+	})
+
+	// wait for the second event to be fully processed instead of sleeping, so that the "not called" assertions below are deterministic (and race-free)
+	suite.awaitProcessedHeartbeat(sut, now.Add(1*time.Minute))
+
+	suite.SummaryRepository.AssertNumberOfCalls(suite.T(), "GetLastBySingleUser", 1)
+	suite.SummaryRepository.AssertNotCalled(suite.T(), "DeleteByUserAfter", mock.Anything, mock.Anything)
+	_ = sut
+}
+
+func (suite *SummaryServiceTestSuite) awaitDeleted(deleted chan time.Time, expected time.Time) {
+	suite.T().Helper()
+	select {
+	case actual := <-deleted:
+		assert.Equal(suite.T(), expected, actual)
+	case <-time.After(2 * time.Second):
+		suite.T().Fatalf("timed out waiting for summaries to be deleted after %v", expected)
+	}
+}
+
+// awaitProcessedHeartbeat waits until the listener finished handling an event with the given timestamp.
+// The heartbeat cache is the last thing written in the listener, and go-cache is internally synchronized.
+func (suite *SummaryServiceTestSuite) awaitProcessedHeartbeat(sut *SummaryService, expected time.Time) {
+	suite.T().Helper()
+	assert.Eventually(suite.T(), func() bool {
+		latest, ok := sut.heartbeatCache.Get("latest_heartbeat_" + TestUserId)
+		return ok && latest.(time.Time).Equal(expected)
+	}, 2*time.Second, 20*time.Millisecond)
+}
+
+func (suite *SummaryServiceTestSuite) createSut() (*SummaryService, *hub.Hub) {
+	// This is a dirty, dirty hack and not thread-safe at all, but should do most of the time.
+	// Rationale: all services use a shared event hub for subscriptions to listen for events.
+	// When running tests that publish an event, it might be received by the subscriber goroutine of some other services, leading to "cross-talk".
+	// We create a custom, isolated event bus here, "very quickly" put it in place right before instantiating the service and restore the original "global" one right after.
+	originalEventBus := config.EventBus()
+	defer config.SetEventBus(originalEventBus)
+	eventBus := hub.New()
+	config.SetEventBus(eventBus)
+	return NewSummaryService(suite.SummaryRepository, suite.HeartbeatService, suite.DurationService, suite.AliasService, suite.ProjectLabelService), eventBus
 }
 
 func filterDurations(from, to time.Time, durations models.Durations) models.Durations {

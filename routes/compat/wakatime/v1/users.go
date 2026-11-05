@@ -28,7 +28,7 @@ func NewUsersHandler(userService services.IUserService, heartbeatService service
 
 func (h *UsersHandler) RegisterRoutes(router chi.Router) {
 	router.Group(func(r chi.Router) {
-		r.Use(middlewares.NewAuthenticateMiddleware(h.userSrvc).Handler)
+		r.Use(middlewares.NewApiAuthenticateMiddleware(h.userSrvc).Handler)
 		r.Get("/compat/wakatime/v1/users/{user}", h.Get)
 	})
 }
@@ -49,7 +49,7 @@ func (h *UsersHandler) Get(w http.ResponseWriter, r *http.Request) {
 	}
 
 	user := v1.NewFromUser(wakapiUser)
-	if hb, err := h.heartbeatSrvc.GetLatestByUser(wakapiUser); err == nil {
+	if hb, err := h.heartbeatSrvc.GetLatestByUser(wakapiUser, false); err == nil {
 		user = user.WithLatestHeartbeat(hb)
 	} else {
 		conf.Log().Request(r).Error("error occurred", "error", err.Error())

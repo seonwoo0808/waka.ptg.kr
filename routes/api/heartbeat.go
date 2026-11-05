@@ -37,7 +37,7 @@ func NewHeartbeatApiHandler(userService services.IUserService, heartbeatService 
 func (h *HeartbeatApiHandler) RegisterRoutes(router chi.Router) {
 	router.Group(func(r chi.Router) {
 		r.Use(
-			middlewares.NewAuthenticateMiddleware(h.userSrvc).WithOptionalForMethods(http.MethodOptions).WithFullAccessOnly(true).Handler,
+			middlewares.NewApiAuthenticateMiddleware(h.userSrvc).WithOptionalForMethods(http.MethodOptions).WithFullAccessOnly(true).Handler,
 			customMiddleware.NewWakatimeRelayMiddleware().Handler,
 		)
 		// see https://github.com/muety/wakapi/issues/203
@@ -80,11 +80,13 @@ func (h *HeartbeatApiHandler) Post(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	userAgent := r.Header.Get("User-Agent")
-	opSys, editor, _ := utils.ParseUserAgent(userAgent)
-	machineName := r.Header.Get("X-Machine-Name")
+	userAgentHeader := r.Header.Get("User-Agent")
+	parsedHeader, _ := utils.ParseUserAgent(userAgentHeader)
+	machineNameHeader := r.Header.Get("X-Machine-Name")
 
+	phCache := newPlaceholderCache(user, h.heartbeatSrvc)
 	creationResults := make(v1.HeartbeatCreationResults, len(heartbeats))
+	validHeartbeats := make([]*models.Heartbeat, 0, len(heartbeats))
 
 	for i, hb := range heartbeats {
 		if hb == nil {
@@ -95,24 +97,34 @@ func (h *HeartbeatApiHandler) Post(w http.ResponseWriter, r *http.Request) {
 			continue
 		}
 
-		// TODO: unit test this
+		userAgent := userAgentHeader
+		opSys := parsedHeader.OS
+		editor := parsedHeader.Editor
+		aiModel := parsedHeader.AIModel
+		machineName := machineNameHeader
+
 		if hb.UserAgent != "" {
 			userAgent = hb.UserAgent
-			localOpSys, localEditor, _ := utils.ParseUserAgent(userAgent)
-			opSys = condition.Ternary[bool, string](localOpSys != "", localOpSys, opSys)
-			editor = condition.Ternary[bool, string](localEditor != "", localEditor, editor)
+			localParsed, _ := utils.ParseUserAgent(userAgent)
+			opSys = condition.Ternary[bool, string](localParsed.OS != "", localParsed.OS, opSys)
+			editor = condition.Ternary[bool, string](localParsed.Editor != "", localParsed.Editor, editor)
+			aiModel = condition.Ternary[bool, string](localParsed.AIModel != "", localParsed.AIModel, aiModel)
 		}
 		if hb.Machine != "" {
 			machineName = hb.Machine
 		}
+		if hb.AIModel != "" {
+			aiModel = hb.AIModel
+		}
 
-		hb = fillPlaceholders(hb, user, h.heartbeatSrvc)
+		hb = fillPlaceholders(hb, phCache)
 
 		hb.User = user
 		hb.UserID = user.ID
 		hb.Machine = machineName
 		hb.OperatingSystem = opSys
 		hb.Editor = editor
+		hb.AIModel = aiModel
 		hb.UserAgent = userAgent
 
 		if !hb.Valid() || !hb.Timely(h.config.App.HeartbeatsMaxAge()) {
@@ -125,22 +137,25 @@ func (h *HeartbeatApiHandler) Post(w http.ResponseWriter, r *http.Request) {
 
 		hb.Hashed()
 		creationResults[i] = v1.HeartbeatSuccess
+		validHeartbeats = append(validHeartbeats, hb)
 	}
 
-	if err := h.heartbeatSrvc.InsertBatch(heartbeats); err != nil {
-		w.WriteHeader(http.StatusInternalServerError)
-		w.Write([]byte(conf.ErrInternalServerError))
-		conf.Log().Request(r).Error("failed to batch-insert heartbeats", "error", err)
-		return
-	}
-
-	if !user.HasData {
-		user.HasData = true
-		if _, err := h.userSrvc.Update(user); err != nil {
+	if len(validHeartbeats) > 0 {
+		if err := h.heartbeatSrvc.InsertBatch(validHeartbeats); err != nil {
 			w.WriteHeader(http.StatusInternalServerError)
 			w.Write([]byte(conf.ErrInternalServerError))
-			conf.Log().Request(r).Error("failed to update user", "userID", user.ID, "error", err)
+			conf.Log().Request(r).Error("failed to batch-insert heartbeats", "error", err)
 			return
+		}
+
+		if !user.HasData {
+			user.HasData = true
+			if _, err := h.userSrvc.Update(user); err != nil {
+				w.WriteHeader(http.StatusInternalServerError)
+				w.Write([]byte(conf.ErrInternalServerError))
+				conf.Log().Request(r).Error("failed to update user", "userID", user.ID, "error", err)
+				return
+			}
 		}
 	}
 
@@ -164,8 +179,45 @@ func makeBulkResponse(results []*v1.HeartbeatCreationResult) *v1.HeartbeatRespon
 	return vm
 }
 
+// Request-scoped, lazily populated cache for resolving heartbeat placeholders, not safe for concurrent use.
+// Note that even after adding service-level caching, this cache still makes sense:
+// if a batch of 30 heartbeats is processed (in fillPlaceholders()) while service cache is cold, it would fire 30 identical queries, while this one shrinks it to one
+type placeholderCache struct {
+	user            *models.User
+	srv             services.IHeartbeatService
+	latest          *models.Heartbeat
+	latestByProject map[string]*models.Heartbeat
+}
+
+func newPlaceholderCache(user *models.User, srv services.IHeartbeatService) *placeholderCache {
+	return &placeholderCache{user: user, srv: srv, latestByProject: make(map[string]*models.Heartbeat)}
+}
+
+func (c *placeholderCache) getLatest() *models.Heartbeat {
+	if c.latest == nil {
+		latest, err := c.srv.GetLatestByUser(c.user, false)
+		if err != nil {
+			return nil
+		}
+		c.latest = latest
+	}
+	return c.latest
+}
+
+func (c *placeholderCache) getLatestByProject(project string) *models.Heartbeat {
+	if latest, ok := c.latestByProject[project]; ok {
+		return latest
+	}
+	latest, err := c.srv.GetLatestByFilters(c.user, models.NewFiltersWith(models.SummaryProject, project), false)
+	if err != nil {
+		return nil
+	}
+	c.latestByProject[project] = latest
+	return latest
+}
+
 // inplace!
-func fillPlaceholders(hb *models.Heartbeat, user *models.User, srv services.IHeartbeatService) *models.Heartbeat {
+func fillPlaceholders(hb *models.Heartbeat, cache *placeholderCache) *models.Heartbeat {
 	// wakatime has a special keyword that indicates to use the most recent project for a given heartbeat
 	// in chrome, the browser extension sends this keyword for (most?) heartbeats
 	// presumably the idea behind this is that if you're coding, your browsing activity will likely also relate to that coding project
@@ -175,23 +227,30 @@ func fillPlaceholders(hb *models.Heartbeat, user *models.User, srv services.IHea
 		hb.ClearPlaceholders() // ignore placeholders for data sent by browser plugin
 	}
 
+	var latestHeartbeat *models.Heartbeat
+
 	if hb.IsPlaceholderProject() {
 		// get project of latest heartbeat by user
-		if latest, err := srv.GetLatestByUser(user); latest != nil && err == nil {
+		if latest := cache.getLatest(); latest != nil {
 			hb.Project = latest.Project
+			latestHeartbeat = latest
 		}
 	}
 
 	if hb.IsPlaceholderLanguage() {
 		// get language of latest heartbeat by user and project
-		if latest, err := srv.GetLatestByFilters(user, models.NewFiltersWith(models.SummaryProject, hb.Project)); latest != nil && err == nil {
+		if latestHeartbeat != nil && latestHeartbeat.Project == hb.Project {
+			hb.Language = latestHeartbeat.Language // reuse the one we just found above
+		} else if latest := cache.getLatestByProject(hb.Project); latest != nil {
 			hb.Language = latest.Language
 		}
 	}
 
 	if hb.IsPlaceholderBranch() {
 		// get branch of latest heartbeat by user and project
-		if latest, err := srv.GetLatestByFilters(user, models.NewFiltersWith(models.SummaryProject, hb.Project)); latest != nil && err == nil {
+		if latestHeartbeat != nil && latestHeartbeat.Project == hb.Project {
+			hb.Branch = latestHeartbeat.Branch // reuse the one we just found above
+		} else if latest := cache.getLatestByProject(hb.Project); latest != nil {
 			hb.Branch = latest.Branch
 		}
 	}

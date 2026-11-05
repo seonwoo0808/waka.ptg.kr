@@ -2,17 +2,19 @@ package config
 
 import (
 	"fmt"
+	"log/slog"
+
 	"github.com/muety/artifex/v2"
 	"github.com/muety/wakapi/utils"
-	"log/slog"
 )
 
 var jobQueues map[string]*artifex.Dispatcher
 var jobCounts map[string]int
 
 const (
-	QueueDefault      = "wakapi.default"
-	QueueProcessing   = "wakapi.processing"
+	QueueDefault    = "wakapi.default"
+	QueueProcessing = "wakapi.processing"
+	// currently only used for durations generation as part of summary aggregation, because the latter wait for the former and we must prevent a deadlock
 	QueueProcessing2  = "wakapi.processing_2"
 	QueueReports      = "wakapi.reports"
 	QueueMails        = "wakapi.mail"
@@ -45,7 +47,7 @@ func InitQueue(name string, workers int) error {
 		return fmt.Errorf("queue '%s' already existing", name)
 	}
 	slog.Info("creating job queue", "name", name, "workers", workers)
-	jobQueues[name] = artifex.NewDispatcher(workers, 4096)
+	jobQueues[name] = artifex.NewDispatcher(workers, 0)
 	jobQueues[name].Start()
 	return nil
 }

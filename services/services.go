@@ -4,6 +4,7 @@ import (
 	"time"
 
 	datastructure "github.com/duke-git/lancet/v2/datastructure/set"
+	"github.com/go-webauthn/webauthn/webauthn"
 	"gorm.io/gorm"
 
 	"github.com/muety/wakapi/models"
@@ -13,8 +14,9 @@ import (
 
 type IAggregationService interface {
 	Schedule()
-	AggregateSummaries(set datastructure.Set[string]) error
-	AggregateDurations(set datastructure.Set[string]) error
+	AggregateSummaries(datastructure.Set[string], types.DurationsRegenerationMode) error
+	AggregateDurations(datastructure.Set[string]) error
+	IsLocked(string) bool
 }
 
 type IMiscService interface {
@@ -34,6 +36,10 @@ type IAliasService interface {
 	GetAliasOrDefault(string, uint8, string) (string, error)
 }
 
+type IProjectService interface {
+	GetUserProjectStats(*models.User, time.Time, time.Time, string, *utils.PageParams, bool) ([]*models.ProjectStats, error)
+}
+
 type IHeartbeatService interface {
 	Insert(*models.Heartbeat) error
 	InsertBatch([]*models.Heartbeat) error
@@ -47,16 +53,17 @@ type IHeartbeatService interface {
 	GetRangeByUser(*models.User) (*models.RangeByUser, error)
 	GetFirstByUser(*models.User) (time.Time, error)
 	GetLastByUser(*models.User) (time.Time, error)
-	GetLatestByUser(*models.User) (*models.Heartbeat, error)
+	GetLatestByUser(*models.User, bool) (*models.Heartbeat, error)
 	GetLatestByOriginAndUser(string, *models.User) (*models.Heartbeat, error)
-	GetLatestByFilters(*models.User, *models.Filters) (*models.Heartbeat, error)
+	GetLatestByFilters(*models.User, *models.Filters, bool) (*models.Heartbeat, error)
 	GetEntitySetByUser(uint8, string) ([]string, error)
 	StreamAllWithin(time.Time, time.Time, *models.User) (chan *models.Heartbeat, error)
+	StreamAllWithinRaw(time.Time, time.Time, *models.User) (chan *models.Heartbeat, error)
+	StreamAllWithinExcludingHeartbeats(time.Time, time.Time, *models.User, []models.HeartbeatExclusionFilter) (chan *models.Heartbeat, error)
 	StreamAllWithinByFilters(time.Time, time.Time, *models.User, *models.Filters) (chan *models.Heartbeat, error)
 	DeleteBefore(time.Time) error
 	DeleteByUser(*models.User) error
 	DeleteByUserBefore(*models.User, time.Time) error
-	GetUserProjectStats(*models.User, time.Time, time.Time, *utils.PageParams, bool) ([]*models.ProjectStats, error)
 	GetUserAgentsByUser(*models.User) ([]*models.UserAgent, error)
 }
 
@@ -106,6 +113,8 @@ type IDurationService interface {
 	Regenerate(*models.User, bool)
 	RegenerateAll()
 	DeleteByUser(*models.User) error
+	DeleteByUserBefore(*models.User, time.Time) error
+	DeleteByUserAfter(*models.User, time.Time) error
 }
 
 type ISummaryService interface {
@@ -113,8 +122,10 @@ type ISummaryService interface {
 	Retrieve(time.Time, time.Time, *models.User, *models.Filters, *time.Duration) (*models.Summary, error)
 	Summarize(time.Time, time.Time, *models.User, *models.Filters, *time.Duration) (*models.Summary, error)
 	GetLatestByUser() ([]*models.TimeByUser, error)
+	GetLatestBySingleUser(string) (time.Time, error)
 	DeleteByUser(string) error
 	DeleteByUserBefore(string, time.Time) error
+	DeleteByUserAfter(string, time.Time) error
 	Insert(*models.Summary) error
 }
 
@@ -154,6 +165,7 @@ type IUserService interface {
 	GetUserByUnsubscribeToken(string) (*models.User, error)
 	GetUserByStripeCustomerId(string) (*models.User, error)
 	GetUserByOidc(string, string) (*models.User, error)
+	GetUserByWebAuthnID(string) (*models.User, error)
 	GetAll() ([]*models.User, error)
 	GetAllMapped() (map[string]*models.User, error)
 	GetMany([]string) ([]*models.User, error)
@@ -180,4 +192,13 @@ type IApiKeyService interface {
 	GetByUser(string) ([]*models.ApiKey, error)
 	Create(*models.ApiKey) (*models.ApiKey, error)
 	Delete(*models.ApiKey) error
+}
+
+type IWebAuthnService interface {
+	CreateCredential(*webauthn.Credential, *models.User, string) (*models.WebAuthnCredential, error)
+	GetCredentialsByUser(*models.User) ([]*models.WebAuthnCredential, error)
+	GetCredentialByUserAndName(*models.User, string) (*models.WebAuthnCredential, error)
+	LoadCredentialIntoUser(*models.User) error
+	DeleteCredential(*models.WebAuthnCredential) error
+	UpdateCredential(*webauthn.Credential) error
 }

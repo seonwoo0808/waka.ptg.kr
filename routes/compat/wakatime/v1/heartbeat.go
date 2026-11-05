@@ -35,7 +35,7 @@ func NewHeartbeatHandler(userService services.IUserService, heartbeatService ser
 
 func (h *HeartbeatHandler) RegisterRoutes(router chi.Router) {
 	router.Group(func(r chi.Router) {
-		r.Use(middlewares.NewAuthenticateMiddleware(h.userSrvc).Handler)
+		r.Use(middlewares.NewApiAuthenticateMiddleware(h.userSrvc).Handler)
 		r.Get("/compat/wakatime/v1/users/{user}/heartbeats", h.Get)
 	})
 }
@@ -57,7 +57,7 @@ func (h *HeartbeatHandler) Get(w http.ResponseWriter, r *http.Request) {
 
 	params := r.URL.Query()
 	dateParam := params.Get("date")
-	date, err := time.Parse(conf.SimpleDateFormat, dateParam)
+	date, err := helpers.ParseDateTimeTZ(dateParam, user.TZ())
 	if err != nil {
 		w.WriteHeader(http.StatusBadRequest)
 		w.Write([]byte("bad date"))

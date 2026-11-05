@@ -14,6 +14,7 @@ import (
 	"time"
 
 	"github.com/duke-git/lancet/v2/condition"
+	"github.com/duke-git/lancet/v2/slice"
 	_ "github.com/glebarez/sqlite"
 	"github.com/go-chi/chi/v5"
 	"github.com/go-chi/chi/v5/middleware"
@@ -22,7 +23,6 @@ import (
 	httpSwagger "github.com/swaggo/http-swagger"
 	_ "gorm.io/driver/mysql"
 	_ "gorm.io/driver/postgres"
-	_ "gorm.io/driver/sqlserver"
 	"gorm.io/gorm"
 	"gorm.io/gorm/logger"
 
@@ -34,7 +34,6 @@ import (
 	"github.com/muety/wakapi/routes/api"
 	shieldsV1Routes "github.com/muety/wakapi/routes/compat/shields/v1"
 	wtV1Routes "github.com/muety/wakapi/routes/compat/wakatime/v1"
-	"github.com/muety/wakapi/routes/relay"
 	"github.com/muety/wakapi/services"
 	"github.com/muety/wakapi/services/mail"
 	"github.com/muety/wakapi/static/docs"
@@ -69,6 +68,7 @@ var (
 	metricsRepository         *repositories.MetricsRepository
 	durationRepository        *repositories.DurationRepository
 	apiKeyRepository          repositories.IApiKeyRepository
+	webAuthnRepository        repositories.IWebAuthnRepository
 )
 
 var (
@@ -77,6 +77,7 @@ var (
 	userService            services.IUserService
 	languageMappingService services.ILanguageMappingService
 	projectLabelService    services.IProjectLabelService
+	projectService         services.IProjectService
 	durationService        services.IDurationService
 	summaryService         services.ISummaryService
 	leaderboardService     services.ILeaderboardService
@@ -89,6 +90,7 @@ var (
 	housekeepingService    services.IHousekeepingService
 	miscService            services.IMiscService
 	apiKeyService          services.IApiKeyService
+	webAuthnService        services.IWebAuthnService
 )
 
 // TODO: Refactor entire project to be structured after business domains
@@ -141,7 +143,11 @@ func main() {
 	// Connect to database
 	var err error
 	slog.Info("starting with database", "dialect", config.Db.Dialect)
-	db, err = gorm.Open(config.Db.GetDialector(), &gorm.Config{Logger: gormLogger}, conf.GetWakapiDBOpts(&config.Db))
+	db, err = gorm.Open(
+		config.Db.GetDialector(),
+		&gorm.Config{Logger: gormLogger, TranslateError: true},
+		conf.GetWakapiDBOpts(&config.Db),
+	)
 	if err != nil {
 		conf.Log().Fatal("could not connect to database", "error", err)
 	}
@@ -175,6 +181,7 @@ func main() {
 	metricsRepository = repositories.NewMetricsRepository(db)
 	durationRepository = repositories.NewDurationRepository(db)
 	apiKeyRepository = repositories.NewApiKeyRepository(db)
+	webAuthnRepository = repositories.NewWebAuthnRepository(db)
 
 	// Services
 	mailService = mail.NewMailService()
@@ -185,14 +192,16 @@ func main() {
 	languageMappingService = services.NewLanguageMappingService(languageMappingRepository)
 	projectLabelService = services.NewProjectLabelService(projectLabelRepository)
 	heartbeatService = services.NewHeartbeatService(heartbeatRepository, languageMappingService)
+	projectService = services.NewProjectService(aliasService, heartbeatRepository, heartbeatService)
 	durationService = services.NewDurationService(durationRepository, heartbeatService, userService, languageMappingService)
 	summaryService = services.NewSummaryService(summaryRepository, heartbeatService, durationService, aliasService, projectLabelService)
 	aggregationService = services.NewAggregationService(userService, summaryService, heartbeatService, durationService)
 	reportService = services.NewReportService(summaryService, userService, mailService)
 	activityService = services.NewActivityService(summaryService)
 	diagnosticsService = services.NewDiagnosticsService(diagnosticsRepository)
-	housekeepingService = services.NewHousekeepingService(userService, heartbeatService, summaryService, aliasRepository) // can pass any repo here
+	housekeepingService = services.NewHousekeepingService(userService, heartbeatService, durationService, projectService, summaryService, aliasRepository) // can pass any repo here
 	miscService = services.NewMiscService(userService, heartbeatService, summaryService, keyValueService, mailService)
+	webAuthnService = services.NewWebAuthnService(webAuthnRepository)
 
 	if config.App.LeaderboardEnabled {
 		leaderboardService = services.NewLeaderboardService(leaderboardRepository, summaryService, userService)
@@ -229,7 +238,7 @@ func main() {
 	wakatimeV1SummariesHandler := wtV1Routes.NewSummariesHandler(userService, summaryService)
 	wakatimeV1StatsHandler := wtV1Routes.NewStatsHandler(userService, summaryService)
 	wakatimeV1UsersHandler := wtV1Routes.NewUsersHandler(userService, heartbeatService)
-	wakatimeV1ProjectsHandler := wtV1Routes.NewProjectsHandler(userService, heartbeatService)
+	wakatimeV1ProjectsHandler := wtV1Routes.NewProjectsHandler(userService, heartbeatService, projectService)
 	wakatimeV1HeartbeatsHandler := wtV1Routes.NewHeartbeatHandler(userService, heartbeatService)
 	wakatimeV1LeadersHandler := wtV1Routes.NewLeadersHandler(userService, leaderboardService)
 	wakatimeV1UserAgentsHandler := wtV1Routes.NewUserAgentsHandler(userService, heartbeatService)
@@ -237,25 +246,34 @@ func main() {
 
 	// MVC Handlers
 	summaryHandler := routes.NewSummaryHandler(summaryService, userService, heartbeatService, durationService, aliasService)
-	settingsHandler := routes.NewSettingsHandler(userService, heartbeatService, durationService, summaryService, aliasService, aggregationService, languageMappingService, projectLabelService, keyValueService, mailService, apiKeyService)
+	settingsHandler := routes.NewSettingsHandler(userService, heartbeatService, durationService, summaryService, aliasService, aggregationService, languageMappingService, projectLabelService, keyValueService, mailService, apiKeyService, webAuthnService)
 	subscriptionHandler := routes.NewSubscriptionHandler(userService, mailService, keyValueService)
-	projectsHandler := routes.NewProjectsHandler(userService, heartbeatService)
+	projectsHandler := routes.NewProjectsHandler(userService, heartbeatService, projectService)
 	homeHandler := routes.NewHomeHandler(userService, keyValueService)
-	loginHandler := routes.NewLoginHandler(userService, mailService, keyValueService)
+	loginHandler := routes.NewLoginHandler(userService, mailService, keyValueService, webAuthnService)
 	imprintHandler := routes.NewImprintHandler(keyValueService)
 	setupHandler := routes.NewSetupHandler(userService)
 	leaderboardHandler := condition.Ternary[bool, routes.Handler](config.App.LeaderboardEnabled, routes.NewLeaderboardHandler(userService, leaderboardService), routes.NewNoopHandler())
 	miscHandler := routes.NewMiscHandler(userService)
 
-	// Other Handlers
-	relayHandler := relay.NewRelayHandler()
-
 	// Setup Routing
 	router := chi.NewRouter()
+
+	trustedProxies := config.Security.TrustReverseProxyIPs()
+	if len(trustedProxies) > 0 {
+		cidrs := slice.Map[net.IPNet, string](trustedProxies, func(_ int, ipNet net.IPNet) string {
+			return ipNet.String()
+		})
+		router.Use(middleware.ClientIPFromXFF(cidrs...))
+	} else {
+		router.Use(middleware.ClientIPFromRemoteAddr)
+	}
+
 	router.Use(
 		middleware.CleanPath,
 		middleware.StripSlashes,
 		middleware.Recoverer,
+		middleware.GetHead,
 		middlewares.NewSharedDataMiddleware(),
 		middlewares.NewLoggingMiddleware(slog.Info, []string{
 			"/assets",
@@ -289,7 +307,6 @@ func main() {
 	projectsHandler.RegisterRoutes(rootRouter)
 	settingsHandler.RegisterRoutes(rootRouter)
 	subscriptionHandler.RegisterRoutes(rootRouter)
-	relayHandler.RegisterRoutes(rootRouter)
 	miscHandler.RegisterRoutes(rootRouter)
 
 	// API route registrations

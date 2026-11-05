@@ -3,6 +3,7 @@ package repositories
 import (
 	"time"
 
+	"github.com/duke-git/lancet/v2/condition"
 	conf "github.com/muety/wakapi/config"
 	"github.com/muety/wakapi/models"
 	"gorm.io/gorm"
@@ -19,9 +20,9 @@ func NewDurationRepository(db *gorm.DB) *DurationRepository {
 
 func (r *DurationRepository) GetAll() ([]*models.Duration, error) {
 	var durations []*models.Duration
-	if err := r.db.
-		Where(&models.Duration{}).
-		Find(&durations).Error; err != nil {
+	q := r.db.Model(&models.Duration{})
+	q = r.queryAddTimeSorting(q, false)
+	if err := q.Find(&durations).Error; err != nil {
 		return nil, err
 	}
 	return durations, nil
@@ -30,7 +31,9 @@ func (r *DurationRepository) GetAll() ([]*models.Duration, error) {
 func (r *DurationRepository) StreamAllBatched(batchSize int) (chan []*models.Duration, error) {
 	out := make(chan []*models.Duration)
 
-	rows, err := r.db.Model(&models.Duration{}).Rows()
+	q := r.db.Model(&models.Duration{})
+	q = r.queryAddTimeSorting(q, false)
+	rows, err := q.Rows()
 	if err != nil {
 		return nil, err
 	}
@@ -44,7 +47,9 @@ func (r *DurationRepository) StreamAllBatched(batchSize int) (chan []*models.Dur
 func (r *DurationRepository) StreamByUserBatched(user *models.User, batchSize int) (chan []*models.Duration, error) {
 	out := make(chan []*models.Duration)
 
-	rows, err := r.db.Model(&models.Duration{UserID: user.ID}).Rows()
+	q := r.db.Model(&models.Duration{}).Where(&models.Duration{UserID: user.ID})
+	q = r.queryAddTimeSorting(q, false)
+	rows, err := q.Rows()
 	if err != nil {
 		return nil, err
 	}
@@ -62,11 +67,9 @@ func (r *DurationRepository) GetAllWithin(from, to time.Time, user *models.User)
 func (r *DurationRepository) GetAllWithinByFilters(from, to time.Time, user *models.User, filterMap map[string][]string) ([]*models.Duration, error) {
 	var durations []*models.Duration
 
-	q := r.db.
-		Where(&models.Duration{UserID: user.ID}).
-		Where("time >= ?", from.Local()).
-		Where("time < ?", to.Local()).
-		Order("time asc")
+	q := r.db.Model(&models.Duration{}).Where(&models.Duration{UserID: user.ID})
+	q = r.queryAddTimeFilterBetween(q, from.Local(), to.Local())
+	q = r.queryAddTimeSorting(q, false)
 
 	if len(filterMap) > 0 {
 		q = filteredQuery(q, filterMap)
@@ -80,16 +83,14 @@ func (r *DurationRepository) GetAllWithinByFilters(from, to time.Time, user *mod
 
 func (r *DurationRepository) GetLatestByUser(user *models.User) (*models.Duration, error) {
 	var duration *models.Duration
-	err := r.db.
-		Where(&models.Duration{UserID: user.ID}).
-		Order("time desc").
-		First(&duration).
-		Error
+	q := r.db.Model(&models.Duration{}).Where(&models.Duration{UserID: user.ID})
+	q = r.queryAddTimeSorting(q, true)
+	err := q.First(&duration).Error
 	return duration, err
 }
 
 func (r *DurationRepository) InsertBatch(durations []*models.Duration) error {
-	return InsertBatchChunked[*models.Duration](durations, &models.Duration{}, r.db)
+	return InsertBatchChunked[*models.Duration](durations, &models.Duration{}, r.db, true)
 }
 
 func (r *DurationRepository) DeleteByUser(user *models.User) error {
@@ -102,11 +103,49 @@ func (r *DurationRepository) DeleteByUser(user *models.User) error {
 }
 
 func (r *DurationRepository) DeleteByUserBefore(user *models.User, t time.Time) error {
-	if err := r.db.
-		Where("user_id = ?", user.ID).
-		Where("time <= ?", t.Local()).
-		Delete(models.Duration{}).Error; err != nil {
+	q := r.db.Model(models.Duration{}).Where("user_id = ?", user.ID)
+	q = r.queryAddTimeFilterLessEqual(q, t.Local())
+	if err := q.Delete(models.Duration{}).Error; err != nil {
 		return err
 	}
 	return nil
+}
+
+func (r *DurationRepository) DeleteByUserAfter(user *models.User, t time.Time) error {
+	q := r.db.Model(models.Duration{}).
+		Where("user_id = ?", user.ID).
+		// we do this just to narrow down the amount of data, since the DATE_ADD() / arithmetic expression prevents from using the index and thus results in a full scan
+		// we optimistically assume that a duration is never longer than 12 hours, which is a safe assumption
+		Where("time >= ?", models.CustomTime(t.Add(-12*time.Hour).Local()))
+	q = r.queryAddTimeFilterGreaterEqual(q, t.Local())
+	if err := q.Delete(models.Duration{}).Error; err != nil {
+		return err
+	}
+	return nil
+}
+
+func (r *DurationRepository) queryAddTimeFilterBetween(q *gorm.DB, from, to time.Time) *gorm.DB {
+	return q.
+		Where("time >= ?", models.CustomTime(from.Local())).
+		Where("time < ?", models.CustomTime(to.Local()))
+}
+
+func (r *DurationRepository) queryAddTimeFilterLessEqual(q *gorm.DB, t time.Time) *gorm.DB {
+	return q.Where("time <= ?", models.CustomTime(t.Local()))
+}
+
+func (r *DurationRepository) queryAddTimeFilterGreaterEqual(q *gorm.DB, t time.Time) *gorm.DB {
+	switch r.GetDialector() {
+	case conf.SQLDialectMysql:
+		return q.Where("DATE_ADD(`time`, INTERVAL (`duration` DIV 1000) MICROSECOND) >= ?", models.CustomTime(t.Local())) // nanoseconds to microseconds
+	case conf.SQLDialectPostgres:
+		return q.Where("time + (duration / 1000000000.0 * interval '1 second') >= ?", models.CustomTime(t.Local())) // nanoseconds to seconds
+	default: // sqlite
+		return q.Where("time + (duration / 1000000) >= ?", t.Local().UnixMilli()) // nanoseconds to milliseconds
+	}
+}
+
+func (r *DurationRepository) queryAddTimeSorting(q *gorm.DB, desc bool) *gorm.DB {
+	order := condition.Ternary(desc, "desc", "asc")
+	return q.Order("time " + order)
 }

@@ -34,31 +34,31 @@
         <div class="flex-grow flex-shrink hidden md:flex justify-start gap-x-4 flex-wrap">
             <div v-scope="EntityFilter({
                 type: 'project',
-                options: wakapiData.projects.map(p => p.key).toSorted(),
+                options: wakapiData.availableProjectNames.toSorted(),
                 selection: null,
             })" @vue:mounted="mounted"></div>
 
             <div v-scope="EntityFilter({
                 type: 'language',
-                options: wakapiData.languages.map(p => p.key).toSorted(),
+                options: wakapiData.availableLanguageNames.toSorted(),
                 selection: null,
             })" @vue:mounted="mounted"></div>
 
             <div v-scope="EntityFilter({
                 type: 'machine',
-                options: wakapiData.machines.map(p => p.key).toSorted(),
+                options: wakapiData.availableMachineNames.toSorted(),
                 selection: null,
             })" @vue:mounted="mounted"></div>
 
             <div v-scope="EntityFilter({
                 type: 'label',
-                options: wakapiData.labels.map(p => p.key).toSorted(),
+                options: wakapiData.availableLabelNames.toSorted(),
                 selection: null,
             })" @vue:mounted="mounted"></div>
 
             <div v-scope="EntityFilter({
                 type: 'category',
-                options: wakapiData.categories.map(p => p.key).toSorted(),
+                options: wakapiData.availableCategoryNames.toSorted(),
                 selection: null,
             })" @vue:mounted="mounted"></div>
         </div>
@@ -95,12 +95,12 @@
                 <span class="font-semibold text-xl truncate" title="{{ .MaxByToString 1 }}">{{ .MaxByToString 1 }}</span>
             </div>
             <div class="flex flex-col w-full p-4 pt-2 rounded-md text-foreground bg-card leading-none border-2 border-accent">
-                <span class="text-xs text-muted font-semibold">Top OS</span>
-                <span class="font-semibold text-xl truncate" title="{{ .MaxByToString 3 }}">{{ .MaxByToString 3 }}</span>
-            </div>
-            <div class="flex flex-col w-full p-4 pt-2 rounded-md text-foreground bg-card leading-none border-2 border-accent">
                 <span class="text-xs text-muted font-semibold">Top Editor</span>
                 <span class="font-semibold text-xl truncate" title="{{ .MaxByToString 2 }}">{{ .MaxByToString 2 }}</span>
+            </div>
+            <div class="flex flex-col w-full p-4 pt-2 rounded-md text-foreground bg-card leading-none border-2 border-accent">
+                <span class="text-xs text-muted font-semibold">AI coding ratio</span>
+                <span class="font-semibold text-xl truncate">{{ printf "%.0f" (mulf64 (.Summary.CategoryRatio "ai coding" "ai coding" "coding") 100) }} %</span>
             </div>
         </div>
 
@@ -315,7 +315,7 @@
                             Hourly Breakdown
                         </span>
                         <span class="iconify inline text-2xl text-secondary p-1 cursor-help" data-icon="octicon:info-16"
-                              title="Only the last 24 hours within the selected interval are shown in this chart. Use Ctrl + wheel to zoom, hold and click to drag."></span>
+                              title="Only the last 24 hours within the selected interval are shown in this chart. Use Ctrl + wheel to zoom, hold and click to drag. If there are too many small segments to be displayed, chart remains blank on purpose."></span>
                     </div>
                 </div>
                 <canvas id="chart-hourly" class="mt-2"></canvas>
@@ -367,6 +367,7 @@
 
                     # <strong>Step 3:</strong> Start coding and then check back here!
                 </div>
+                <p>To track coding activity in Wakapi and WakaTime <strong>simultaneously</strong>, check <a class="text-secondary hover:text-foreground" href="https://github.com/wakatime/wakatime-cli/blob/develop/USAGE.md#api-urls-section" target="_blank" rel="noreferrer noopener">these instructions</a>.</p>
             </div>
         </div>
 
@@ -399,6 +400,11 @@
     wakapiData.hourlyBreakdown = {{ .HourlyBreakdown | json }}
     wakapiData.hourlyBreakdownFromTime = {{ .HourlyBreakdownFrom | json }}
     wakapiData.hourlyBreakdownToTime = {{ .SummaryParams.To | json }}
+    wakapiData.availableProjectNames = {{ .AvailableFilters.ProjectNames | json }}
+    wakapiData.availableLanguageNames = {{ .AvailableFilters.LanguageNames | json }}
+    wakapiData.availableMachineNames = {{ .AvailableFilters.MachineNames | json }}
+    wakapiData.availableLabelNames = {{ .AvailableFilters.LabelNames | json }}
+    wakapiData.availableCategoryNames = {{ .AvailableFilters.CategoryNames | json }}
     {{ if .IsProjectDetails }}
     wakapiData.branches = {{ .Branches | json }}
     wakapiData.entities = {{ .Entities | json }}

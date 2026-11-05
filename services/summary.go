@@ -2,14 +2,17 @@ package services
 
 import (
 	"errors"
+	"fmt"
 	"log/slog"
 	"sort"
 	"strconv"
 	"strings"
+	"sync"
 	"time"
 
 	"github.com/becheran/wildmatch-go"
 	"github.com/duke-git/lancet/v2/condition"
+	datastructure "github.com/duke-git/lancet/v2/datastructure/set"
 	"github.com/duke-git/lancet/v2/datetime"
 	"github.com/duke-git/lancet/v2/slice"
 	"github.com/leandro-lugaresi/hub"
@@ -23,6 +26,9 @@ import (
 type SummaryService struct {
 	config              *config.Config
 	cache               *cache.Cache
+	heartbeatCache      *cache.Cache
+	userCacheKeys       map[string]datastructure.Set[string] // active cache keys tracked per user for targeted invalidation
+	userCacheLock       sync.Mutex
 	eventBus            *hub.Hub
 	repository          repositories.ISummaryRepository
 	heartbeatService    IHeartbeatService
@@ -35,6 +41,8 @@ func NewSummaryService(summaryRepo repositories.ISummaryRepository, heartbeatSer
 	srv := &SummaryService{
 		config:              config.Get(),
 		cache:               cache.New(24*time.Hour, 24*time.Hour),
+		heartbeatCache:      cache.New(24*time.Hour, 24*time.Hour),
+		userCacheKeys:       make(map[string]datastructure.Set[string]),
 		eventBus:            config.EventBus(),
 		repository:          summaryRepo,
 		heartbeatService:    heartbeatService,
@@ -43,12 +51,40 @@ func NewSummaryService(summaryRepo repositories.ISummaryRepository, heartbeatSer
 		projectLabelService: projectLabelService,
 	}
 
-	sub1 := srv.eventBus.Subscribe(0, config.TopicProjectLabel)
+	sub1 := srv.eventBus.Subscribe(0, config.TopicProjectLabel) // published from project label service
 	go func(sub *hub.Subscription) {
 		for m := range sub.Receiver {
 			srv.invalidateUserCache(m.Fields[config.FieldUserId].(string))
 		}
 	}(&sub1)
+
+	sub2 := srv.eventBus.Subscribe(0, config.EventHeartbeatCreate)
+	go func(sub *hub.Subscription) {
+		for m := range sub.Receiver {
+			heartbeat := m.Fields[config.FieldPayload].(*models.Heartbeat)
+			cacheKey := fmt.Sprintf("latest_heartbeat_%s", heartbeat.UserID)
+
+			if latestHeartbeatTime, ok := srv.heartbeatCache.Get(cacheKey); !ok || heartbeat.Time.T().Before(latestHeartbeatTime.(time.Time)) {
+				if latestSummaryTime, err := srv.GetLatestBySingleUser(heartbeat.UserID); err != nil {
+					config.Log().Error("failed to retrieve latest summary time for user", "user", heartbeat.UserID, "error", err)
+				} else if latestSummaryTime.After(heartbeat.Time.T()) {
+					slog.Info("got heartbeat older than the user's latest summary, clearing newer summaries", "user", heartbeat.UserID, "heartbeat_time", heartbeat.Time.T(), "latest_summary_time", latestSummaryTime)
+					if err := srv.DeleteByUserAfter(heartbeat.UserID, heartbeat.Time.T()); err != nil {
+						config.Log().Error("failed to delete user summaries after receiving historical heartbeat", "user", heartbeat.UserID, "error", err)
+					}
+				}
+			}
+
+			srv.heartbeatCache.SetDefault(cacheKey, heartbeat.Time.T())
+		}
+	}(&sub2)
+
+	sub3 := srv.eventBus.Subscribe(0, config.TopicAlias) // published from alias service
+	go func(sub *hub.Subscription) {
+		for m := range sub.Receiver {
+			srv.invalidateUserCache(m.Fields[config.FieldUserId].(string))
+		}
+	}(&sub3)
 
 	return srv
 }
@@ -74,7 +110,9 @@ func (srv *SummaryService) Aliased(from, to time.Time, user *models.User, f type
 
 	// Post-process filters
 	if filters != nil {
-		filters = filters.WithProjectLabels(resolveProjectLabelsReverse)
+		if !filters.Project.Exists() {
+			filters = filters.WithProjectLabels(resolveProjectLabelsReverse)
+		}
 		filters = filters.WithAliases(resolveAliasesReverse)
 	}
 
@@ -101,6 +139,14 @@ func (srv *SummaryService) Aliased(from, to time.Time, user *models.User, f type
 	}
 
 	srv.cache.SetDefault(cacheKey, summary)
+
+	srv.userCacheLock.Lock()
+	if _, ok := srv.userCacheKeys[user.ID]; !ok {
+		srv.userCacheKeys[user.ID] = datastructure.New[string]()
+	}
+	srv.userCacheKeys[user.ID].Add(cacheKey)
+	srv.userCacheLock.Unlock()
+
 	return summary.Sorted().InTZ(user.TZ()), nil
 }
 
@@ -243,6 +289,10 @@ func (srv *SummaryService) GetLatestByUser() ([]*models.TimeByUser, error) {
 	return srv.repository.GetLastByUser()
 }
 
+func (srv *SummaryService) GetLatestBySingleUser(userId string) (time.Time, error) {
+	return srv.repository.GetLastBySingleUser(userId)
+}
+
 func (srv *SummaryService) DeleteByUser(userId string) error {
 	srv.invalidateUserCache(userId)
 	return srv.repository.DeleteByUser(userId)
@@ -253,9 +303,14 @@ func (srv *SummaryService) DeleteByUserBefore(userId string, t time.Time) error 
 	return srv.repository.DeleteByUserBefore(userId, t)
 }
 
+func (srv *SummaryService) DeleteByUserAfter(userId string, t time.Time) error {
+	srv.invalidateUserCache(userId)
+	return srv.repository.DeleteByUserAfter(userId, t)
+}
+
 func (srv *SummaryService) Insert(summary *models.Summary) error {
 	srv.invalidateUserCache(summary.UserID)
-	return srv.repository.Insert(summary)
+	return srv.repository.InsertWithRetry(summary)
 }
 
 // Private summary generation and utility methods
@@ -434,7 +489,7 @@ func (srv *SummaryService) mergeSummaryItems(existing []*models.SummaryItem, new
 
 func (srv *SummaryService) getMissingIntervals(from, to time.Time, summaries []*models.Summary, precise bool) []*models.Interval {
 	if len(summaries) == 0 {
-		return []*models.Interval{{from, to}}
+		return []*models.Interval{{Start: from, End: to}}
 	}
 
 	intervals := make([]*models.Interval, 0)
@@ -509,8 +564,15 @@ func (srv *SummaryService) getHash(args ...string) string {
 }
 
 func (srv *SummaryService) invalidateUserCache(userId string) {
-	for key := range srv.cache.Items() {
-		if strings.Contains(key, userId) {
+	srv.userCacheLock.Lock()
+	keys, found := srv.userCacheKeys[userId]
+	if found {
+		delete(srv.userCacheKeys, userId)
+	}
+	srv.userCacheLock.Unlock()
+
+	if found {
+		for key := range keys {
 			srv.cache.Delete(key)
 		}
 	}

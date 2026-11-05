@@ -14,21 +14,18 @@ import (
 	"github.com/muety/wakapi/utils"
 	"gorm.io/driver/postgres"
 
-	"gorm.io/driver/sqlserver"
 	"gorm.io/gorm"
 	"gorm.io/gorm/schema"
 )
 
 const (
-	UserKey               = "user"
-	ImprintKey            = "imprint"
-	AuthCookieKey         = config.CookieKeyAuth
-	PersistentIntervalKey = "wakapi_summary_interval"
-)
-
-var (
-	hacksInitialized     bool
-	postgresTimezoneHack bool
+	UserKey                   = "user"
+	ImprintKey                = "imprint"
+	AuthCookieKey             = config.CookieKeyAuth
+	OidcIdTokenCookieKey      = config.CookieKeyOidcIdToken
+	OidcRefreshTokenCookieKey = config.CookieKeyOidcRefreshToken
+	OidcProviderCookieKey     = config.CookieKeyOidcProvider
+	PersistentIntervalKey     = "wakapi_summary_interval"
 )
 
 type KeyStringValue struct {
@@ -50,20 +47,18 @@ type KeyedInterval struct {
 type CustomTime time.Time
 
 func (j CustomTime) GormDBDataType(db *gorm.DB, field *schema.Field) string {
+	if db.Dialector.Name() == (sqlite.Dialector{}).Name() {
+		return "integer" // unix epoch milliseconds for correct timezone-agnostic comparison (see #882, #960)
+	}
+
 	t := "timestamp"
 
-	// sql server doesn't allow multiple columns with timestamp type in a column
-	// So we need to change the type to datetimeoffset
-	if db.Config.Dialector.Name() == (sqlserver.Dialector{}).Name() {
-		t = "datetimeoffset"
-	} else if db.Config.Dialector.Name() == (postgres.Dialector{}).Name() {
+	if db.Config.Dialector.Name() == (postgres.Dialector{}).Name() {
 		// TODO: migrate to timestamptz, see https://github.com/muety/wakapi/issues/771
 	}
 
-	if db.Dialector.Name() != (sqlite.Dialector{}).Name() { // https://github.com/glebarez/go-sqlite/issues/186
-		if scale, ok := field.TagSettings["TIMESCALE"]; ok {
-			t += fmt.Sprintf("(%s)", scale)
-		}
+	if scale, ok := field.TagSettings["TIMESCALE"]; ok {
+		t += fmt.Sprintf("(%s)", scale)
 	}
 
 	return t
@@ -90,32 +85,39 @@ func (j *CustomTime) Scan(value interface{}) error {
 		err error
 	)
 
-	switch value.(type) {
+	switch v := value.(type) {
+	case nil:
+		*j = CustomTime(time.Time{})
+		return nil
+	case int64:
+		t = time.UnixMilli(v)
+	case float64:
+		t = time.UnixMilli(int64(v))
 	case string:
-		// this is only for safety / backwards compatibility, because, the driver itself should already properly parse dates
-		// however, that's not always guaranteed, e.g. see https://github.com/glebarez/go-sqlite/issues/186
-		t, err = time.Parse("2006-01-02 15:04:05-07:00", value.(string)) // string format used by glebarez/sqlite driver
+		// This is only for safety / backwards compatibility, because, the driver itself should already properly parse dates
+		// However, that's not always guaranteed, e.g. see https://github.com/glebarez/go-sqlite/issues/186
+		t, err = time.Parse("2006-01-02 15:04:05-07:00", v) // string format used by glebarez/sqlite driver
 		if err != nil {
-			t, err = time.Parse(time.RFC3339, value.(string)) // iso format used by ncruces/go-sqlite3 driver and others
+			t, err = time.Parse(time.RFC3339, v) // iso format used by ncruces/go-sqlite3 driver and others
+		}
+		if err != nil {
+			t, err = time.Parse("2006-01-02 15:04:05", v) // format without timezone offset (formerly used by SQL fixtures)
 		}
 		if err != nil {
 			return errors.New(fmt.Sprintf("unsupported date time format: %s", value))
 		}
 	case time.Time:
-		t = value.(time.Time)
-		break
+		t = v
+		// See https://github.com/muety/wakapi/issues/771 -> "reinterpret" Postgres dates (received as UTC) in local zone, assuming they had also originally been inserted as such.
+		// To clarify: you'd expect this to be guarded by a check for whether we're actually dealing with Postgres. We used to have this, but intentionally removed it in 8143ca1 to fix the dbmigrate.go.
+		// The reason this works nonetheless is "by accident", because only for Postgres will dates actually be retrieved with a UTC timestamp.
+		// For SQLite, we'll get int64 anyway, and for MySQL, everything will be converted to local server time due to `loc=Local` in the connection string (see https://dev.mysql.com/doc/refman/8.4/en/datetime.html).
+		// Counterpart of this is in `Value()` (see below).
+		if v.Location() == time.UTC {
+			t = utils.SetZone(t, time.Local)
+		}
 	default:
 		return errors.New(fmt.Sprintf("unsupported type: %T", value))
-	}
-
-	// see https://github.com/muety/wakapi/issues/771
-	// -> "reinterpret" postgres dates (received as UTC) in local zone, assuming they had also originally been inserted as such
-	if !hacksInitialized {
-		postgresTimezoneHack = config.Get().Db.IsPostgres()
-		hacksInitialized = true
-	}
-	if postgresTimezoneHack {
-		t = utils.SetZone(t, time.Local)
 	}
 
 	t = t.In(time.Local).Round(time.Millisecond)
@@ -125,7 +127,17 @@ func (j *CustomTime) Scan(value interface{}) error {
 }
 
 func (j CustomTime) Value() (driver.Value, error) {
-	return j.T().Round(time.Millisecond), nil
+	t := j.T().Round(time.Millisecond)
+	if config.Get().Db.IsSQLite() {
+		return t.UnixMilli(), nil
+	}
+	if config.Get().Db.IsPostgres() {
+		// Hack: because we use `timestamp` column type (not `timestamptz` or sth.) for Postgres, time zone information will simply get stripped,
+		// i.e. only the wall clock time gets persisted (e.g. "17:00 +02:00" -> "17:00").
+		// When retrieving dates via Scan() (see above) we already have this hack in place to always interpret UTC as local tz. This is the "write" part of the hack.
+		return t.In(time.Local), nil
+	}
+	return t, nil
 }
 
 func (j *CustomTime) Hash() (uint64, error) {

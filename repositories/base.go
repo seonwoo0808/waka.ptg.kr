@@ -8,7 +8,6 @@ import (
 
 	"github.com/duke-git/lancet/v2/slice"
 	conf "github.com/muety/wakapi/config"
-	"gorm.io/driver/sqlserver"
 	"gorm.io/gorm"
 	"gorm.io/gorm/clause"
 )
@@ -92,10 +91,22 @@ func (r *BaseRepository) VacuumOrOptimize() {
 	conf.Log().Info("skipping vacuuming or optimization, because running on neither sqlite, nor postgres, nor mysql")
 }
 
-func InsertBatchChunked[T any](data []T, model T, db *gorm.DB) error {
+func InsertBatchChunked[T any](data []T, model T, db *gorm.DB, txPerBatch bool) error {
 	// insert in chunks, because otherwise sqlite (later also mysql) will complain about too many placeholders in prepared query, see https://github.com/muety/wakapi/issues/840
+	chunks := slice.Chunk[T](data, chunkSize)
+
+	if txPerBatch {
+		for _, chunk := range chunks {
+			if err := db.Transaction(func(tx *gorm.DB) error {
+				return insertBatch[T](chunk, model, tx)
+			}); err != nil {
+				return err
+			}
+		}
+		return nil
+	}
+
 	return db.Transaction(func(tx *gorm.DB) error {
-		chunks := slice.Chunk[T](data, chunkSize)
 		for _, chunk := range chunks {
 			if err := insertBatch[T](chunk, model, tx); err != nil {
 				return err
@@ -106,22 +117,6 @@ func InsertBatchChunked[T any](data []T, model T, db *gorm.DB) error {
 }
 
 func insertBatch[T any](data []T, model T, db *gorm.DB) error {
-	// sqlserver on conflict has bug https://github.com/go-gorm/sqlserver/issues/100
-	// As a workaround, insert one by one, and ignore duplicate key error
-	if db.Dialector.Name() == (sqlserver.Dialector{}).Name() {
-		for _, h := range data {
-			err := db.Create(h).Error
-			if err != nil {
-				if strings.Contains(err.Error(), "Cannot insert duplicate key row in object") {
-					// ignored
-				} else {
-					return err
-				}
-			}
-		}
-		return nil
-	}
-
 	if err := db.
 		Clauses(clause.OnConflict{
 			DoNothing: true,

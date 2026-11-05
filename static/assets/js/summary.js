@@ -74,9 +74,12 @@ function draw(subselection) {
         return {
             callbacks: {
                 label: (item) => {
+                    const raw = item.chart.data.datasets[item.datasetIndex].data[item.dataIndex]
+                    const val = (typeof raw === 'object' && raw !== null) ? raw.x : raw
+                    const lbl = (typeof raw === 'object' && raw !== null && raw.details) ? raw.details : item.chart.data.labels[item.dataIndex]
                     const d = stacked
-                        ? [item.chart.data.datasets[item.datasetIndex].data[item.dataIndex], item.chart.data.datasets[item.datasetIndex].label]
-                        : [item.chart.data.datasets[item.datasetIndex].data[item.dataIndex], item.chart.data.labels[item.dataIndex]]
+                        ? [val, item.chart.data.datasets[item.datasetIndex].label]
+                        : [val, lbl]
                     return ` ${d[1]}: ${d[0].toString().toHHMMSS()}`
                 },
                 title: () => 'Total Time',
@@ -391,7 +394,11 @@ function draw(subselection) {
                 datasets: [{
                     data: wakapiData.entities
                         .slice(0, Math.min(showTopN[7], wakapiData.entities.length))
-                        .map(p => parseInt(p.total)),
+                        .map(p => ({
+                            x: parseInt(p.total),
+                            y: extractFile(p.key),
+                            details: p.key
+                        })),
                     backgroundColor: wakapiData.entities.map((p, i) => {
                         const c = hexToRgb(vibrantColors ? getRandomColor(p.key) : getColor(p.key, i % baseColors.length))
                         return `rgba(${c.r}, ${c.g}, ${c.b}, 1)`
@@ -544,6 +551,13 @@ function draw(subselection) {
                         // "The values for the first bar of a stack are absolute values, all following values of the same stack must be relative to the end of the previous bar"
                         data[i] = [+fromTime - pre, +toTime - pre, `${fromTime.toLocaleTimeString()} - ${toTime.toLocaleTimeString()} (${(cur.duration / 1e9).toString().toHHMMSS()})`]
                         pre = +toTime
+
+                        if (data[i] < 0) {
+                            // this shouldn't happen since backend should be merging overlapping intervals, but since golang's duration is in nanosecond (1s=1e9) while javascript's date is in millisecond (1s=1e3), there might be some edge cases where due to rounding errors, the duration are overlapping, which causes the from_time to be before the previous to_time, thus resulting in negative duration for the current bar. In that case, we just set the duration to 0 to avoid showing negative bar.
+                            console.warn(`Negative duration for project ${project} at index ${i}, likely due to rounding errors. Setting duration to 0.`)
+                            data[i][0] = 0
+                        }
+
                         return {
                             data,
                             backgroundColor: vibrantColors ? getRandomColor(project) : getColor(project, i % baseColors.length),
@@ -564,7 +578,7 @@ function draw(subselection) {
                         min: +new Date(wakapiData.hourlyBreakdownFromTime),
                         max: +new Date(wakapiData.hourlyBreakdownToTime),
                         ticks: {
-                            stepSize: 1000 * 60 * 60, // pre hour
+                            stepSize: 1000 * 60 * 60, // per hour
                             callback: (value) => {
                                 return new Date(value).toLocaleString([], {
                                     dateStyle: 'short',

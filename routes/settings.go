@@ -5,22 +5,26 @@ import (
 	"fmt"
 	"log/slog"
 	"net/http"
-	"net/url"
+	"slices"
 	"sort"
 	"strconv"
 	"strings"
+	"sync"
 	"time"
+	"uuid"
 
 	"github.com/duke-git/lancet/v2/condition"
 	datastructure "github.com/duke-git/lancet/v2/datastructure/set"
 	"github.com/go-chi/chi/v5"
-	"github.com/gofrs/uuid/v5"
+	"github.com/go-webauthn/webauthn/protocol"
+	"github.com/go-webauthn/webauthn/webauthn"
 	"github.com/gorilla/schema"
 
 	conf "github.com/muety/wakapi/config"
 	"github.com/muety/wakapi/helpers"
 	"github.com/muety/wakapi/middlewares"
 	"github.com/muety/wakapi/models"
+	"github.com/muety/wakapi/models/types"
 	"github.com/muety/wakapi/models/view"
 	routeutils "github.com/muety/wakapi/routes/utils"
 	"github.com/muety/wakapi/services"
@@ -31,20 +35,22 @@ import (
 const criticalError = "a critical error has occurred, sorry"
 
 type SettingsHandler struct {
-	config              *conf.Config
-	userSrvc            services.IUserService
-	summarySrvc         services.ISummaryService
-	heartbeatSrvc       services.IHeartbeatService
-	durationSrvc        services.IDurationService
-	aliasSrvc           services.IAliasService
-	aggregationSrvc     services.IAggregationService
-	languageMappingSrvc services.ILanguageMappingService
-	projectLabelSrvc    services.IProjectLabelService
-	keyValueSrvc        services.IKeyValueService
-	mailSrvc            services.IMailService
-	apiKeySrvc          services.IApiKeyService
-	httpClient          *http.Client
-	aggregationLocks    map[string]bool
+	config                *conf.Config
+	userSrvc              services.IUserService
+	summarySrvc           services.ISummaryService
+	heartbeatSrvc         services.IHeartbeatService
+	durationSrvc          services.IDurationService
+	aliasSrvc             services.IAliasService
+	aggregationSrvc       services.IAggregationService
+	languageMappingSrvc   services.ILanguageMappingService
+	projectLabelSrvc      services.IProjectLabelService
+	keyValueSrvc          services.IKeyValueService
+	mailSrvc              services.IMailService
+	apiKeySrvc            services.IApiKeyService
+	WebAuthnSrvc          services.IWebAuthnService
+	httpClient            *http.Client
+	aggregationLocks      map[string]bool
+	aggregationLocksMutex sync.RWMutex
 }
 
 type action func(w http.ResponseWriter, r *http.Request) actionResult
@@ -72,6 +78,7 @@ func NewSettingsHandler(
 	keyValueService services.IKeyValueService,
 	mailService services.IMailService,
 	apiKeyService services.IApiKeyService,
+	webAuthnService services.IWebAuthnService,
 ) *SettingsHandler {
 	return &SettingsHandler{
 		config:              conf.Get(),
@@ -86,19 +93,26 @@ func NewSettingsHandler(
 		keyValueSrvc:        keyValueService,
 		mailSrvc:            mailService,
 		apiKeySrvc:          apiKeyService,
-		httpClient:          &http.Client{Timeout: 10 * time.Second},
-		aggregationLocks:    make(map[string]bool),
+		WebAuthnSrvc:        webAuthnService,
+		httpClient: &http.Client{
+			Timeout: 10 * time.Second,
+			CheckRedirect: func(req *http.Request, via []*http.Request) error {
+				return http.ErrUseLastResponse // forbid following redirects
+			},
+		},
+		aggregationLocks: make(map[string]bool),
 	}
 }
 
 func (h *SettingsHandler) RegisterRoutes(router chi.Router) {
 	r := chi.NewRouter()
 	r.Use(
-		middlewares.NewAuthenticateMiddleware(h.userSrvc).
+		middlewares.NewWebAuthenticateMiddleware(h.userSrvc).
 			WithRedirectTarget(defaultErrorRedirectTarget()).
 			WithRedirectErrorMessage("unauthorized").Handler,
 	)
 	r.Get("/", h.GetIndex)
+	r.Get("/webauthn/options", h.GetWebAuthnOptions)
 	r.Post("/", h.PostIndex)
 
 	router.Mount("/settings", r)
@@ -201,12 +215,55 @@ func (h *SettingsHandler) dispatchAction(action string) action {
 		return h.actionUpdateExcludeUnknownProjects
 	case "update_heartbeats_timeout":
 		return h.actionUpdateHeartbeatsTimeout
+	case "update_readme_stats_base_url":
+		return h.actionUpdateReadmeStatsBaseUrl
 	case "add_api_key":
 		return h.actionAddApiKey
 	case "delete_api_key":
 		return h.actionDeleteApiKey
+	case "webauthn_add":
+		return h.actionWebAuthnAdd
+	case "webauthn_delete":
+		return h.actionWebAuthnDelete
 	}
 	return nil
+}
+
+func (h *SettingsHandler) GetWebAuthnOptions(w http.ResponseWriter, r *http.Request) {
+	if h.config.IsDev() {
+		loadTemplates()
+	}
+	if h.config.Security.DisableWebAuthn {
+		routeutils.RespondJSONError(w, http.StatusForbidden, "webauthn is disabled on this server")
+		return
+	}
+	user := middlewares.GetPrincipal(r)
+	if user.AuthType != "local" {
+		routeutils.RespondJSONError(w, http.StatusBadRequest, "webauthn is only available for local users")
+		return
+	}
+
+	if err := h.WebAuthnSrvc.LoadCredentialIntoUser(user); err != nil {
+		conf.Log().Request(r).Error("error while loading webauthn credentials", "error", err)
+		routeutils.RespondJSONError(w, http.StatusInternalServerError, "error while loading webauthn credentials")
+		return
+	}
+
+	webAuthnOptions, session, err := conf.WebAuthn.BeginRegistration(user, webauthn.WithAuthenticatorSelection(protocol.AuthenticatorSelection{
+		RequireResidentKey: protocol.ResidentKeyRequired(), // for usernameless login
+	}))
+	if err != nil {
+		conf.Log().Request(r).Error("error while getting webauthn registration options", "error", err)
+		routeutils.RespondJSONError(w, http.StatusInternalServerError, "error while getting webauthn registration options")
+		return
+	}
+
+	if err = routeutils.SetWebAuthnSession(session, r, w); err != nil {
+		conf.Log().Request(r).Error("error while setting webauthn session", "error", err)
+		routeutils.RespondJSONError(w, http.StatusInternalServerError, "error while getting webauthn registration options")
+		return
+	}
+	routeutils.RespondJSON(w, http.StatusOK, webAuthnOptions)
 }
 
 func (h *SettingsHandler) actionUpdateUser(w http.ResponseWriter, r *http.Request) actionResult {
@@ -232,6 +289,10 @@ func (h *SettingsHandler) actionUpdateUser(w http.ResponseWriter, r *http.Reques
 		return actionResult{http.StatusBadRequest, "", "cannot unset email while subscription is active", nil}
 	}
 
+	oldLoc := condition.Ternary(user.Location == "", "Local", user.Location)
+	newLoc := condition.Ternary(payload.Location == "", "Local", payload.Location)
+	tzChanged := oldLoc != newLoc
+
 	user.Email = payload.Email
 	user.Location = payload.Location
 	user.StartOfWeek = payload.StartOfWeek
@@ -243,6 +304,21 @@ func (h *SettingsHandler) actionUpdateUser(w http.ResponseWriter, r *http.Reques
 			return actionResult{http.StatusBadRequest, "", "got invalid user data (email already taken?)", nil}
 		}
 		return actionResult{http.StatusInternalServerError, "", conf.ErrInternalServerError, nil}
+	}
+
+	if tzChanged { // existing summaries are aligned to the old time zone's day boundaries, so they need to be regenerated
+		if !h.tryLockAggregation(user.ID) {
+			return actionResult{http.StatusOK, "user updated successfully, please regenerate your summaries manually", "", nil}
+		}
+
+		go func(user *models.User, r *http.Request) {
+			defer h.toggleAggregationLock(user.ID, false)
+			if err := h.regenerateSummaries(user); err != nil {
+				conf.Log().Request(r).Error("failed to regenerate summaries after time zone change", "userID", user.ID, "error", err)
+			}
+		}(user, r)
+
+		return actionResult{http.StatusAccepted, "user updated successfully, your summaries are being regenerated to match your new time zone - this may take up to a couple of minutes", "", nil}
 	}
 
 	return actionResult{http.StatusOK, "user updated successfully", "", nil}
@@ -286,16 +362,6 @@ func (h *SettingsHandler) actionChangePassword(w http.ResponseWriter, r *http.Re
 		return actionResult{http.StatusInternalServerError, "", conf.ErrInternalServerError, nil}
 	}
 
-	login := &models.Login{
-		Username: user.ID,
-		Password: user.Password,
-	}
-	encoded, err := h.config.Security.SecureCookie.Encode(models.AuthCookieKey, login.Username)
-	if err != nil {
-		return actionResult{http.StatusInternalServerError, "", conf.ErrInternalServerError, nil}
-	}
-
-	http.SetCookie(w, h.config.CreateCookie(models.AuthCookieKey, encoded))
 	return actionResult{http.StatusOK, "password was updated successfully", "", nil}
 }
 
@@ -316,6 +382,12 @@ func (h *SettingsHandler) actionChangeUserId(w http.ResponseWriter, r *http.Requ
 
 	if _, err := h.userSrvc.ChangeUserId(user, newUserId); err != nil {
 		return actionResult{http.StatusInternalServerError, "", conf.ErrInternalServerError, nil}
+	}
+
+	oidcProviders := h.config.Security.ListOidcProviders()
+	if slices.Contains(oidcProviders, user.AuthType) {
+		// OIDC Users will remain authenticated, just return ok
+		return actionResult{http.StatusOK, fmt.Sprintf("Successfully changed your username to %s", newUserId), "", nil}
 	}
 
 	routeutils.SetSuccess(r, w, fmt.Sprintf("Successfully changed your username to %s, please log back in.", newUserId))
@@ -367,10 +439,6 @@ func (h *SettingsHandler) actionUpdateExcludeUnknownProjects(w http.ResponseWrit
 	user := middlewares.GetPrincipal(r)
 	defer h.userSrvc.FlushCache()
 
-	if h.isAggregationLocked(user.ID) {
-		return actionResult{http.StatusConflict, "", "summary regeneration already in progress, please wait", nil}
-	}
-
 	user.ExcludeUnknownProjects, err = strconv.ParseBool(r.PostFormValue("exclude_unknown_projects"))
 
 	if err != nil {
@@ -380,8 +448,11 @@ func (h *SettingsHandler) actionUpdateExcludeUnknownProjects(w http.ResponseWrit
 		return actionResult{http.StatusInternalServerError, "", "internal sever error", nil}
 	}
 
+	if !h.tryLockAggregation(user.ID) {
+		return actionResult{http.StatusConflict, "", "summary regeneration already in progress, please wait", nil}
+	}
+
 	go func(user *models.User, r *http.Request) {
-		h.toggleAggregationLock(user.ID, true)
 		defer h.toggleAggregationLock(user.ID, false)
 		if err := h.regenerateSummaries(user); err != nil {
 			conf.Log().Request(r).Error("failed to regenerate summaries for user", "userID", user.ID, "error", err)
@@ -412,6 +483,23 @@ func (h *SettingsHandler) actionUpdateHeartbeatsTimeout(w http.ResponseWriter, r
 	}
 
 	return actionResult{http.StatusOK, "Done. To apply this change to already existing data, please regenerate your summaries.", "", nil}
+}
+
+func (h *SettingsHandler) actionUpdateReadmeStatsBaseUrl(w http.ResponseWriter, r *http.Request) actionResult {
+	if h.config.IsDev() {
+		loadTemplates()
+	}
+
+	user := middlewares.GetPrincipal(r)
+	defer h.userSrvc.FlushUserCache(user.ID)
+
+	user.ReadmeStatsBaseUrl = r.PostFormValue("readme_stats_base_url")
+
+	if _, err := h.userSrvc.Update(user); err != nil {
+		return actionResult{http.StatusInternalServerError, "", "internal sever error", nil}
+	}
+
+	return actionResult{http.StatusOK, "settings updated", "", nil}
 }
 
 func (h *SettingsHandler) actionUpdateSharing(w http.ResponseWriter, r *http.Request) actionResult {
@@ -610,7 +698,7 @@ func (h *SettingsHandler) actionSetWakatimeApiKey(w http.ResponseWriter, r *http
 	}
 
 	// Healthcheck, if a new API key is set, i.e. the feature is activated
-	if (user.WakatimeApiKey == "" && apiKey != "") && !h.validateWakatimeKey(apiKey, apiUrl) {
+	if (user.WakatimeApiKey == "" && apiKey != "") && (!h.validateWakatimeUrl(apiUrl) || !h.validateWakatimeKey(apiKey, apiUrl)) {
 		return actionResult{http.StatusBadRequest, "", "failed to connect to WakaTime, API key or endpoint URL invalid?", nil}
 	}
 
@@ -639,6 +727,11 @@ func (h *SettingsHandler) actionImportWakatime(w http.ResponseWriter, r *http.Re
 	kvKeyLastImport := fmt.Sprintf("%s_%s", conf.KeyLastImport, user.ID)
 	kvKeyLastImportSuccess := fmt.Sprintf("%s_%s", conf.KeyLastImportSuccess, user.ID)
 
+	importer := imports.NewWakatimeImporter(user.WakatimeApiKey, useLegacyImporter)
+	if err := importer.Validate(user); err != nil {
+		return actionResult{http.StatusForbidden, "", fmt.Sprintf("Failed to import – %v", err), nil}
+	}
+
 	if !h.config.IsDev() {
 		lastImport, _ := time.Parse(time.RFC822, h.keyValueSrvc.MustGetString(kvKeyLastImport).Value)
 		if time.Now().Sub(lastImport) < time.Duration(h.config.App.ImportBackoffMin)*time.Minute {
@@ -661,9 +754,8 @@ func (h *SettingsHandler) actionImportWakatime(w http.ResponseWriter, r *http.Re
 		}
 	}
 
-	go func(user *models.User, r *http.Request) {
+	go func(user *models.User, importer *imports.WakatimeImporter, r *http.Request) {
 		start := time.Now()
-		importer := imports.NewWakatimeImporter(user.WakatimeApiKey, useLegacyImporter)
 
 		countBefore, _ := h.heartbeatSrvc.CountByUser(user)
 
@@ -713,7 +805,16 @@ func (h *SettingsHandler) actionImportWakatime(w http.ResponseWriter, r *http.Re
 		countAfter, _ := h.heartbeatSrvc.CountByUser(user)
 		slog.Info("downloaded heartbeats for user", "count", count, "userID", user.ID, "importedCount", countAfter-countBefore)
 
-		h.regenerateSummaries(user)
+		if h.tryLockAggregation(user.ID) {
+			func(user *models.User, r *http.Request) {
+				defer h.toggleAggregationLock(user.ID, false)
+				if err := h.regenerateSummaries(user); err != nil {
+					conf.Log().Request(r).Error("failed to regenerate summaries for user", "userID", user.ID, "error", err)
+				}
+			}(user, r)
+		} else {
+			conf.Log().Request(r).Warn("summary regeneration already in progress after import", "userID", user.ID)
+		}
 
 		if !user.HasData {
 			user.HasData = true
@@ -729,7 +830,7 @@ func (h *SettingsHandler) actionImportWakatime(w http.ResponseWriter, r *http.Re
 				slog.Info("sent import notification mail", "userID", user.ID)
 			}
 		}
-	}(user, r)
+	}(user, importer, r)
 
 	h.keyValueSrvc.PutString(&models.KeyStringValue{
 		Key:   kvKeyLastImport,
@@ -746,12 +847,11 @@ func (h *SettingsHandler) actionRegenerateSummaries(w http.ResponseWriter, r *ht
 
 	user := middlewares.GetPrincipal(r)
 
-	if h.isAggregationLocked(user.ID) {
+	if !h.tryLockAggregation(user.ID) {
 		return actionResult{http.StatusConflict, "", "summary regeneration already in progress, please wait", nil}
 	}
 
 	go func(user *models.User, r *http.Request) {
-		h.toggleAggregationLock(user.ID, true)
 		defer h.toggleAggregationLock(user.ID, false)
 		if err := h.regenerateSummaries(user); err != nil {
 			conf.Log().Request(r).Error("failed to regenerate summaries for user", "userID", user.ID, "error", err)
@@ -769,8 +869,13 @@ func (h *SettingsHandler) actionClearData(w http.ResponseWriter, r *http.Request
 	user := middlewares.GetPrincipal(r)
 	slog.Info("user requested to delete all data", "userID", user.ID)
 
+	if !h.tryLockAggregation(user.ID) { // simply misuse the aggregation locking for data deletion as well
+		return actionResult{http.StatusConflict, "", "data deletion for this user is already in progress, try again later", nil}
+	}
+
 	go func(user *models.User, r *http.Request) {
 		slog.Info("deleting summaries for user", "userID", user.ID)
+		defer h.toggleAggregationLock(user.ID, false)
 		if err := h.summarySrvc.DeleteByUser(user.ID); err != nil {
 			conf.Log().Request(r).Error("failed to clear summaries", "error", err)
 		}
@@ -817,7 +922,7 @@ func (h *SettingsHandler) actionGenerateInvite(w http.ResponseWriter, r *http.Re
 	}
 
 	user := middlewares.GetPrincipal(r)
-	inviteCode := uuid.Must(uuid.NewV4()).String()[0:8]
+	inviteCode := uuid.NewV4().String()[0:8]
 
 	if err := h.keyValueSrvc.PutString(&models.KeyStringValue{
 		Key:   fmt.Sprintf("%s_%s", conf.KeyInviteCode, inviteCode),
@@ -834,6 +939,10 @@ func (h *SettingsHandler) actionGenerateInvite(w http.ResponseWriter, r *http.Re
 			valueInviteCode: inviteCode,
 		},
 	}
+}
+
+func (h *SettingsHandler) validateWakatimeUrl(baseUrl string) bool {
+	return routeutils.ValidateWakatimeUrl(baseUrl) == nil
 }
 
 func (h *SettingsHandler) validateWakatimeKey(apiKey string, baseUrl string) bool {
@@ -859,7 +968,15 @@ func (h *SettingsHandler) validateWakatimeKey(apiKey string, baseUrl string) boo
 
 	request.Header = headers
 
-	if _, err = utils.RaiseForStatus(h.httpClient.Do(request)); err != nil {
+	res, err := utils.RaiseForStatus(h.httpClient.Do(request))
+	if err != nil {
+		return false
+	}
+	defer res.Body.Close()
+
+	// as the client does not follow redirects and RaiseForStatus only raises for 4xx and 5xx, a 3xx status must be treated as an error, too
+	// e.g. wakatime may respond with a 302 as a failure indicator, see https://github.com/muety/wakapi/issues/986
+	if res.StatusCode >= 300 && res.StatusCode < 400 {
 		return false
 	}
 
@@ -874,7 +991,7 @@ func (h *SettingsHandler) regenerateSummaries(user *models.User) error {
 		return err
 	}
 
-	if err := h.aggregationSrvc.AggregateSummaries(datastructure.New(user.ID)); err != nil { // involves regenerating durations as well
+	if err := h.aggregationSrvc.AggregateSummaries(datastructure.New(user.ID), types.DurationsRegenerationFull); err != nil { // involves regenerating durations as well
 		conf.Log().Error("failed to regenerate summaries", "error", err)
 		return err
 	}
@@ -887,7 +1004,7 @@ func (h *SettingsHandler) actionAddApiKey(w http.ResponseWriter, r *http.Request
 		loadTemplates()
 	}
 
-	apiKey := uuid.Must(uuid.NewV4()).String()
+	apiKey := uuid.NewV4().String()
 
 	if _, err := h.apiKeySrvc.Create(&models.ApiKey{
 		User:     middlewares.GetPrincipal(r),
@@ -928,6 +1045,85 @@ func (h *SettingsHandler) actionDeleteApiKey(w http.ResponseWriter, r *http.Requ
 		}
 	}
 	return actionResult{http.StatusNotFound, "", "API key not found", nil}
+}
+
+func (h *SettingsHandler) actionWebAuthnAdd(w http.ResponseWriter, r *http.Request) actionResult {
+	if h.config.IsDev() {
+		loadTemplates()
+	}
+
+	if h.config.Security.DisableWebAuthn {
+		return actionResult{http.StatusForbidden, "", "webauthn is disabled on this server", nil}
+	}
+
+	user := middlewares.GetPrincipal(r)
+	if user.AuthType != "local" {
+		return actionResult{http.StatusBadRequest, "", "cannot add webauthn authenticator for non-local user", nil}
+	}
+
+	if err := h.WebAuthnSrvc.LoadCredentialIntoUser(user); err != nil {
+		conf.Log().Request(r).Error("could not load webauthn credentials for user", "error", err)
+		return actionResult{http.StatusInternalServerError, "", "could not load webauthn credentials for user", nil}
+	}
+	authenticatorName := strings.TrimSpace(r.PostFormValue("authenticator_name"))
+	if authenticatorName == "" {
+		return actionResult{http.StatusBadRequest, "", "authenticator name must not be empty", nil}
+	}
+
+	for _, c := range user.Credentials {
+		if c.Name == authenticatorName {
+			return actionResult{http.StatusBadRequest, "", "authenticator name already in use", nil}
+		}
+	}
+
+	credentialJSON := r.PostFormValue("credential_json")
+	sessionData, err := routeutils.GetWebAuthnSession(r)
+	if err != nil {
+		return actionResult{http.StatusBadRequest, "", "could not get webauthn session data", nil}
+	}
+	// why not use FinishRegistration here?
+	// that's because the credentialJSON is not all the request data, but only part of it
+	pcc, err := protocol.ParseCredentialCreationResponseBytes([]byte(credentialJSON))
+	if err != nil {
+		conf.Log().Request(r).Error("error while parsing webauthn register response", "error", err.Error())
+		return actionResult{http.StatusBadRequest, "", "could not parse credential creation response", nil}
+	}
+	credential, err := conf.WebAuthn.CreateCredential(user, *sessionData, pcc)
+	if err != nil {
+		conf.Log().Request(r).Error("error while processing webauthn register", "error", err.Error())
+		return actionResult{http.StatusBadRequest, "", "could not create webauthn credential", nil}
+	}
+	_, err = h.WebAuthnSrvc.CreateCredential(credential, user, authenticatorName)
+	if err != nil {
+		return actionResult{http.StatusInternalServerError, "", "could not store webauthn credential", nil}
+	}
+
+	return actionResult{http.StatusOK, "webauthn authenticator added successfully", "", nil}
+}
+
+func (h *SettingsHandler) actionWebAuthnDelete(w http.ResponseWriter, r *http.Request) actionResult {
+	if h.config.IsDev() {
+		loadTemplates()
+	}
+
+	if h.config.Security.DisableWebAuthn {
+		return actionResult{http.StatusForbidden, "", "webauthn is disabled on this server", nil}
+	}
+
+	user := middlewares.GetPrincipal(r)
+	if user.AuthType != "local" {
+		return actionResult{http.StatusBadRequest, "", "cannot delete webauthn authenticator for non-local user", nil}
+	}
+
+	credentialName := r.PostFormValue("credential_name")
+	credential, err := h.WebAuthnSrvc.GetCredentialByUserAndName(user, credentialName)
+	if err != nil || credential == nil {
+		return actionResult{http.StatusNotFound, "", "webauthn credential not found", nil}
+	}
+	if err := h.WebAuthnSrvc.DeleteCredential(credential); err != nil {
+		return actionResult{http.StatusInternalServerError, "", "could not delete webauthn credential", nil}
+	}
+	return actionResult{http.StatusOK, "webauthn authenticator deleted successfully", "", nil}
 }
 
 func (h *SettingsHandler) buildViewModel(r *http.Request, w http.ResponseWriter, args *map[string]interface{}) *view.SettingsViewModel {
@@ -1058,21 +1254,14 @@ func (h *SettingsHandler) buildViewModel(r *http.Request, w http.ResponseWriter,
 		})
 	}
 
-	vm := &view.SettingsViewModel{
-		SharedLoggedInViewModel: view.SharedLoggedInViewModel{
-			SharedViewModel: view.NewSharedViewModel(h.config, nil),
-			User:            user,
-		},
-		LanguageMappings:    mappings,
-		Aliases:             combinedAliases,
-		Labels:              combinedLabels,
-		Projects:            projects,
-		UserFirstData:       firstData,
-		SubscriptionPrice:   subscriptionPrice,
-		SupportContact:      h.config.App.SupportContact,
-		DataRetentionMonths: h.config.App.DataRetentionMonths,
-		InviteLink:          inviteLink,
-		ApiKeys:             combinedApiKeys,
+	if h.WebAuthnSrvc.LoadCredentialIntoUser(user) != nil {
+		conf.Log().Request(r).Error("error while loading webauthn credentials into user", "user", user.ID, "error", err)
+		return &view.SettingsViewModel{
+			SharedLoggedInViewModel: view.SharedLoggedInViewModel{
+				SharedViewModel: view.NewSharedViewModel(h.config, &view.Messages{Error: criticalError}),
+				User:            user,
+			},
+		}
 	}
 
 	// readme card params
@@ -1080,18 +1269,51 @@ func (h *SettingsHandler) buildViewModel(r *http.Request, w http.ResponseWriter,
 	if err, maxRange := helpers.ResolveMaximumRange(user.ShareDataMaxDays); err == nil {
 		readmeCardTitle += fmt.Sprintf(" (%v)", maxRange.GetHumanReadable())
 	}
-	vm.ReadmeCardCustomTitle = url.QueryEscape(readmeCardTitle)
+
+	vm := &view.SettingsViewModel{
+		SharedViewModel:       view.NewSharedViewModel(h.config, nil),
+		User:                  user,
+		LanguageMappings:      mappings,
+		Aliases:               combinedAliases,
+		Labels:                combinedLabels,
+		Projects:              projects,
+		UserFirstData:         firstData,
+		SubscriptionPrice:     subscriptionPrice,
+		SupportContact:        h.config.App.SupportContact,
+		DataRetentionMonths:   h.config.App.DataRetentionMonths,
+		InviteLink:            inviteLink,
+		ApiKeys:               combinedApiKeys,
+		WebAuthnCredentials:   user.Credentials,
+		ReadmeCardCustomTitle: readmeCardTitle,
+		DisableWebAuthn:       h.config.Security.DisableWebAuthn,
+	}
 
 	return routeutils.WithSessionMessages(vm, r, w)
 }
 
+func (h *SettingsHandler) tryLockAggregation(userId string) bool {
+	// note that the way this lock is currently used, it effectively only locks the (short) pre-aggregation phase of deleting user data
+	// but is otherwise superseded by the aggregation service's own locking mechanism
+	h.aggregationLocksMutex.Lock()
+	defer h.aggregationLocksMutex.Unlock()
+	if h.aggregationLocks[userId] || h.aggregationSrvc.IsLocked(userId) {
+		return false
+	}
+	h.aggregationLocks[userId] = true
+	return true
+}
+
 func (h *SettingsHandler) toggleAggregationLock(userId string, locked bool) {
+	h.aggregationLocksMutex.Lock()
+	defer h.aggregationLocksMutex.Unlock()
 	h.aggregationLocks[userId] = locked
 }
 
 func (h *SettingsHandler) isAggregationLocked(userId string) bool {
+	h.aggregationLocksMutex.RLock()
+	defer h.aggregationLocksMutex.RUnlock()
 	locked, _ := h.aggregationLocks[userId]
-	return locked
+	return locked || h.aggregationSrvc.IsLocked(userId)
 }
 
 func getVal[T any](values *map[string]interface{}, key string, fallback T) T {

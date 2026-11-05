@@ -41,6 +41,8 @@ let icons = [
     'ic:round-dashboard',
     'ci:settings-filled',
     'akar-icons:chevron-down',
+    'akar-icons:chevron-left',
+    'akar-icons:chevron-right',
     'ls:logout',
     'fluent:key-32-filled',
     'majesticons:clipboard-copy',
@@ -94,6 +96,7 @@ let icons = [
     'twemoji:flag-germany',
     'ic:round-download',
     'ic:outline-integration-instructions',
+    'bi:key-fill',
 ]
 
 const output = path.normalize(path.join(__dirname, '../static/assets/js/icons.dist.js'))

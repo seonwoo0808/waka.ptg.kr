@@ -1,9 +1,10 @@
 package models
 
 import (
-	"github.com/stretchr/testify/assert"
 	"testing"
 	"time"
+
+	"github.com/stretchr/testify/assert"
 )
 
 func TestSummary_FillMissing(t *testing.T) {
@@ -284,4 +285,92 @@ func TestSummary_ApplyFilter(t *testing.T) {
 	assert.Len(t, *sut.GetByType(SummaryLanguage), 1)
 	assert.Equal(t, key2, sut.Projects[0].Key)
 	assert.Equal(t, 20*time.Minute, sut.TotalTimeBy(SummaryProject))
+}
+
+func TestSummaryParams_IsProjectDetails(t *testing.T) {
+	t.Run("empty filters", func(t *testing.T) {
+		sut := &SummaryParams{
+			Filters: &Filters{},
+		}
+		assert.False(t, sut.IsProjectDetails())
+	})
+
+	t.Run("single project", func(t *testing.T) {
+		sut := &SummaryParams{
+			Filters: &Filters{
+				Project: []string{"wakapi"},
+			},
+		}
+		assert.True(t, sut.IsProjectDetails())
+	})
+
+	t.Run("multiple projects", func(t *testing.T) {
+		sut := &SummaryParams{
+			Filters: &Filters{
+				Project: []string{"wakapi", "anchr"},
+			},
+		}
+		assert.False(t, sut.IsProjectDetails())
+	})
+
+	t.Run("project and language", func(t *testing.T) {
+		sut := &SummaryParams{
+			Filters: &Filters{
+				Project:  []string{"wakapi"},
+				Language: []string{"Go"},
+			},
+		}
+		assert.False(t, sut.IsProjectDetails())
+	})
+
+	t.Run("project with aliases", func(t *testing.T) {
+		filters := &Filters{
+			Project: []string{"wakapi"},
+		}
+
+		resolver := func(t uint8, k string) []string {
+			if t == SummaryProject && k == "wakapi" {
+				return []string{"wakapi-mobile", "wakapi-web"}
+			}
+			return []string{}
+		}
+
+		filters.WithAliases(resolver)
+
+		sut := &SummaryParams{
+			Filters: filters,
+		}
+
+		assert.Len(t, sut.Filters.Project, 3)
+		assert.True(t, sut.IsProjectDetails())
+	})
+
+	t.Run("multiple projects with aliases", func(t *testing.T) {
+		filters := &Filters{
+			Project: []string{"wakapi", "anchr"},
+		}
+
+		resolver := func(t uint8, k string) []string {
+			if t == SummaryProject && k == "wakapi" {
+				return []string{"wakapi-mobile"}
+			}
+			return []string{}
+		}
+
+		filters.WithAliases(resolver)
+
+		sut := &SummaryParams{
+			Filters: filters,
+		}
+
+		assert.Len(t, sut.Filters.Project, 3)
+		assert.False(t, sut.IsProjectDetails())
+	})
+
+	t.Run("single project with select filtered only", func(t *testing.T) {
+		sut := &SummaryParams{
+			Filters: (&Filters{Project: []string{"wakapi"}}).WithSelectFilteredOnly(),
+		}
+		assert.False(t, sut.IsProjectDetails())
+	})
 }
